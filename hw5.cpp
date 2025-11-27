@@ -140,6 +140,82 @@ int main(int argc, char** argv) {
     // TODO
     int gravity_device_id = -999;
     double missile_cost = -999;
+    // If there is no collision in Problem 2, no missile is needed.
+    if (hit_time_step <= -1) {
+        gravity_device_id = -1;
+        missile_cost = 0.0;
+    } else {
+        // Try destroying each device (one at a time) and simulate whether
+        // the planet is saved. Choose the device with lowest missile cost
+        // that prevents collision.
+        double best_cost = std::numeric_limits<double>::infinity();
+        int best_id = -1;
+
+        // read initial state again so we have untouched starting values
+        read_input(argv[1], n, planet, asteroid, qx, qy, qz, vx, vy, vz, m, type);
+
+        for (int d = 0; d < n; d++) {
+            if (type[d] != "device") continue;
+
+            // copy initial state for simulation
+            std::vector<double> qx2 = qx, qy2 = qy, qz2 = qz;
+            std::vector<double> vx2 = vx, vy2 = vy, vz2 = vz;
+            std::vector<double> m2 = m;
+            std::vector<std::string> type2 = type;
+
+            bool destroyed = false;
+            bool collided = false;
+            double cost_for_this = 0.0;
+
+            for (int step = 0; step <= param::n_steps; step++) {
+                if (step > 0) {
+                    run_step(step, n, qx2, qy2, qz2, vx2, vy2, vz2, m2, type2);
+                }
+
+                // missile launched at start; check hit after positions updated
+                if (!destroyed) {
+                    // compute distance between planet and device at current step
+                    double dx = qx2[planet] - qx2[d];
+                    double dy = qy2[planet] - qy2[d];
+                    double dz = qz2[planet] - qz2[d];
+                    double dist_planet_device = sqrt(dx * dx + dy * dy + dz * dz);
+
+                    double missile_traveled = step * param::dt * param::missile_speed;
+                    if (missile_traveled > dist_planet_device) {
+                        // device is destroyed at this step
+                        destroyed = true;
+                        type2[d] = "destroyed";
+                        m2[d] = 0.0;
+                        cost_for_this = param::get_missile_cost(step * param::dt);
+                    }
+                }
+
+                // after possible destruction, check planet-asteroid collision
+                double dxp = qx2[planet] - qx2[asteroid];
+                double dyp = qy2[planet] - qy2[asteroid];
+                double dzp = qz2[planet] - qz2[asteroid];
+                if (dxp * dxp + dyp * dyp + dzp * dzp < param::planet_radius * param::planet_radius) {
+                    collided = true;
+                    break;
+                }
+            }
+
+            if (!collided) {
+                if (cost_for_this < best_cost) {
+                    best_cost = cost_for_this;
+                    best_id = d;
+                }
+            }
+        }
+
+        if (best_id == -1) {
+            gravity_device_id = -1;
+            missile_cost = 0.0;
+        } else {
+            gravity_device_id = best_id;
+            missile_cost = best_cost;
+        }
+    }
 
     write_output(argv[2], min_dist, hit_time_step, gravity_device_id, missile_cost);
 }
