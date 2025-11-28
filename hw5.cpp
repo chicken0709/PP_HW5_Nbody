@@ -57,46 +57,68 @@ __global__ void compute_forces_update_v(int n, double* qx, double* qy, double* q
                                         double* vx, double* vy, double* vz,
                                         double* m, int* type, double t) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-
+    
     double ax = 0.0, ay = 0.0, az = 0.0;
-    double my_qx = qx[i];
-    double my_qy = qy[i];
-    double my_qz = qz[i];
+    double my_qx, my_qy, my_qz;
 
-    for (int j = 0; j < n; j++) {
-        if (i == j) continue;
-        double mj = m[j];
-        // type: 0 = planet, 1 = asteroid, 2 = device, 3 = destroyed
-        if (type[j] == 2) {
-            mj = gravity_device_mass(mj, t);
-        }
-        
-        double dx = qx[j] - my_qx;
-        double dy = qy[j] - my_qy;
-        double dz = qz[j] - my_qz;
-        double dist2 = dx * dx + dy * dy + dz * dz + d_eps * d_eps;
-        double dist3 = dist2 * sqrt(dist2);
-        
-        double f = d_G * mj / dist3;
-        ax += f * dx;
-        ay += f * dy;
-        az += f * dz;
+    if (i < n) {
+        my_qx = qx[i];
+        my_qy = qy[i];
+        my_qz = qz[i];
     }
 
-    vx[i] += ax * d_dt;
-    vy[i] += ay * d_dt;
-    vz[i] += az * d_dt;
-}
+    __shared__ double s_qx[256];
+    __shared__ double s_qy[256];
+    __shared__ double s_qz[256];
+    __shared__ double s_m[256];
+    __shared__ int s_type[256];
 
-__global__ void update_positions(int n, double* qx, double* qy, double* qz,
-                                 double* vx, double* vy, double* vz) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    for (int tile = 0; tile < n; tile += blockDim.x) {
+        int idx = tile + threadIdx.x;
+        if (idx < n) {
+            s_qx[threadIdx.x] = qx[idx];
+            s_qy[threadIdx.x] = qy[idx];
+            s_qz[threadIdx.x] = qz[idx];
+            s_m[threadIdx.x] = m[idx];
+            s_type[threadIdx.x] = type[idx];
+        }
+        __syncthreads();
 
-    if (i >= n) return;
-    qx[i] += vx[i] * d_dt;
-    qy[i] += vy[i] * d_dt;
-    qz[i] += vz[i] * d_dt;
+        if (i < n) {
+            int limit = (tile + blockDim.x > n) ? (n - tile) : blockDim.x;
+            for (int j = 0; j < limit; j++) {
+                int global_j = tile + j;
+                if (i == global_j) continue;
+
+                double mj = s_m[j];
+                if (s_type[j] == 2) {
+                    mj = gravity_device_mass(mj, t);
+                }
+                
+                double dx = s_qx[j] - my_qx;
+                double dy = s_qy[j] - my_qy;
+                double dz = s_qz[j] - my_qz;
+                double dist2 = dx * dx + dy * dy + dz * dz + d_eps * d_eps;
+                double dist3 = dist2 * sqrt(dist2);
+                
+                double f = d_G * mj / dist3;
+                ax += f * dx;
+                ay += f * dy;
+                az += f * dz;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (i < n) {
+        vx[i] += ax * d_dt;
+        vy[i] += ay * d_dt;
+        vz[i] += az * d_dt;
+
+        qx[i] += vx[i] * d_dt;
+        qy[i] += vy[i] * d_dt;
+        qz[i] += vz[i] * d_dt;
+    }
 }
 
 __global__ void check_collision_kernel(int planet, int asteroid, double* qx, double* qy, double* qz, int* hit_step, int step) {
@@ -235,7 +257,6 @@ int main(int argc, char** argv) {
         for (int step = 0; step <= param::n_steps; step++) {
             if (step > 0) {
                 compute_forces_update_v<<<numBlocks, blockSize>>>(sys.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_m, d_type, step * param::dt);
-                update_positions<<<numBlocks, blockSize>>>(sys.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz);
                 check_min_dist_kernel<<<1, 1>>>(sys.planet, sys.asteroid, d_qx, d_qy, d_qz, d_min_dist);
             }
         }
@@ -282,7 +303,6 @@ int main(int argc, char** argv) {
         for (int step = 0; step <= param::n_steps; step++) {
             if (step > 0) {
                 compute_forces_update_v<<<numBlocks, blockSize>>>(sys.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_m, d_type, step * param::dt);
-                update_positions<<<numBlocks, blockSize>>>(sys.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz);
             }
             check_collision_kernel<<<1, 1>>>(sys.planet, sys.asteroid, d_qx, d_qy, d_qz, d_hit_step, step);
         }
@@ -358,7 +378,6 @@ int main(int argc, char** argv) {
             for (int step = 0; step <= param::n_steps; step++) {
                 if (step > 0) {
                     compute_forces_update_v<<<numBlocks, blockSize>>>(sys.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_m, d_type, step * param::dt);
-                    update_positions<<<numBlocks, blockSize>>>(sys.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz);
                 }
                 check_missile_kernel<<<1, 1>>>(sys.planet, d_idx, d_qx, d_qy, d_qz, d_m, d_type, step, d_destroyed_step);
                 check_collision_kernel<<<1, 1>>>(sys.planet, sys.asteroid, d_qx, d_qy, d_qz, d_hit_step, step);
