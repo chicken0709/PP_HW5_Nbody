@@ -307,6 +307,12 @@ int main(int argc, char** argv) {
                 run_step<<<numBlocks, blockSize>>>(sys.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_m, d_type, step * param::dt);
             }
             check_collision_kernel<<<1, 1>>>(sys.planet, sys.asteroid, d_qx, d_qy, d_qz, d_hit_step, step);
+                    
+            if (step % 2000 == 0) {
+                int h_hit;
+                HIP_CHECK(hipMemcpy(&h_hit, d_hit_step, sizeof(int), hipMemcpyDeviceToHost));
+                if (h_hit != -1) break;
+            }
         }
         
         int h_hit_step;
@@ -383,6 +389,12 @@ int main(int argc, char** argv) {
                 }
                 check_missile_kernel<<<1, 1>>>(sys.planet, d_idx, d_qx, d_qy, d_qz, d_m, d_type, step, d_destroyed_step);
                 check_collision_kernel<<<1, 1>>>(sys.planet, sys.asteroid, d_qx, d_qy, d_qz, d_hit_step, step);
+                                
+                if (step % 2000 == 0) {
+                    int h_hit;
+                    HIP_CHECK(hipMemcpy(&h_hit, d_hit_step, sizeof(int), hipMemcpyDeviceToHost));
+                    if (h_hit != -1) break;
+                }
             }
             
             int h_hit_step, h_destroyed_step;
