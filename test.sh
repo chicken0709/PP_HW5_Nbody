@@ -7,5 +7,6 @@ fi
 
 TC=$1
 
+make clean && make
 srun -t 00:10:00 --gres=gpu:2 ./hw5 testcases/b${TC}.in b${TC}.out
 python3 ./validate.py b${TC}.out testcases/b${TC}.out

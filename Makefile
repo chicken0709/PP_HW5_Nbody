@@ -17,6 +17,6 @@ seq: nbody.cc
 
 .PHONY: clean
 clean:
-	rm -f $(TARGET) $(SEQUENTIAL)
+	rm -f $(TARGET) $(SEQUENTIAL) *.out hw5
 
 

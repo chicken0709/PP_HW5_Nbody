@@ -1,2 +1,4 @@
 nbody
 hw5
+__pycache__/
+*.out
