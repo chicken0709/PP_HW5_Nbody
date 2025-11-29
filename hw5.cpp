@@ -48,7 +48,7 @@ __global__ void check_min_dist(int planet, int asteroid, double* qx, double* qy,
     }
 }
 
-__global__ void run_step(int n, double* qx, double* qy, double* qz,
+__global__ void compute_forces_update_velocity(int n, double* qx, double* qy, double* qz,
                                         double* vx, double* vy, double* vz,
                                         double* m, double* m0, int* type, double t,
                                         int planet, int asteroid, double* min_dist) {
@@ -117,9 +117,19 @@ __global__ void run_step(int n, double* qx, double* qy, double* qz,
     }
 
     if (i < n) {
-        vx[i] += ax * d_dt; qx[i] += vx[i] * d_dt;
-        vy[i] += ay * d_dt; qy[i] += vy[i] * d_dt;
-        vz[i] += az * d_dt; qz[i] += vz[i] * d_dt;
+        vx[i] += ax * d_dt;
+        vy[i] += ay * d_dt;
+        vz[i] += az * d_dt;
+    }
+}
+
+__global__ void update_position(int n, double* qx, double* qy, double* qz,
+                           double* vx, double* vy, double* vz) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        qx[i] += vx[i] * d_dt;
+        qy[i] += vy[i] * d_dt;
+        qz[i] += vz[i] * d_dt;
     }
 }
 
@@ -217,13 +227,13 @@ void read_input(const char* filename, Data& ctx) {
     ctx.m.resize(ctx.n); ctx.type.resize(ctx.n);
     
     for (int i = 0; i < ctx.n; i++) {
-        std::string t;
+        std::string type;
         fin >> ctx.qx[i] >> ctx.qy[i] >> ctx.qz[i] 
             >> ctx.vx[i] >> ctx.vy[i] >> ctx.vz[i] 
-            >> ctx.m[i] >> t;
-        if (t == "planet") ctx.type[i] = 0;
-        else if (t == "asteroid") ctx.type[i] = 1;
-        else if (t == "device") ctx.type[i] = 2;
+            >> ctx.m[i] >> type;
+        if (type == "planet") ctx.type[i] = 0;
+        else if (type == "asteroid") ctx.type[i] = 1;
+        else if (type == "device") ctx.type[i] = 2;
         else ctx.type[i] = 3;
     }
 }
@@ -318,7 +328,8 @@ int main(int argc, char** argv) {
         
         for (int step = 0; step <= param::n_steps; step++) {
             if (step > 0) {
-                run_step<<<numBlocks, blockSize>>>(ctx.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_m, nullptr, d_type, step * param::dt, ctx.planet, ctx.asteroid, d_min_dist);
+                compute_forces_update_velocity<<<numBlocks, blockSize>>>(ctx.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_m, nullptr, d_type, step * param::dt, ctx.planet, ctx.asteroid, d_min_dist);
+                update_position<<<numBlocks, blockSize>>>(ctx.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz);
             }
         }
         check_min_dist<<<1, 1>>>(ctx.planet, ctx.asteroid, d_qx, d_qy, d_qz, d_min_dist);
@@ -379,7 +390,8 @@ int main(int argc, char** argv) {
 
         for (int step = 0; step <= param::n_steps; step++) {
             if (step > 0) {
-                run_step<<<numBlocks, blockSize>>>(ctx.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_m, d_m0, d_type, step * param::dt, 0, 0, nullptr);
+                compute_forces_update_velocity<<<numBlocks, blockSize>>>(ctx.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_m, d_m0, d_type, step * param::dt, 0, 0, nullptr);
+                update_position<<<numBlocks, blockSize>>>(ctx.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz);
             }
             check_hits<<<numBlocks, blockSize>>>(ctx.n, ctx.planet, ctx.asteroid, d_qx, d_qy, d_qz, d_type, step, d_saved_step, d_hit_step);
             save_state<<<numBlocks, blockSize>>>(ctx.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_m, d_type, step, d_saved_step,
@@ -490,7 +502,8 @@ int main(int argc, char** argv) {
 
             for (int step = start_step; step <= param::n_steps; step++) {
                 if (step > start_step) {
-                    run_step<<<numBlocks, blockSize>>>(ctx.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_m, d_m0, d_type, step * param::dt, 0, 0, nullptr);
+                    compute_forces_update_velocity<<<numBlocks, blockSize>>>(ctx.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_m, d_m0, d_type, step * param::dt, 0, 0, nullptr);
+                    update_position<<<numBlocks, blockSize>>>(ctx.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz);
                 }
                 check_hit_and_destroy<<<1, 1>>>(ctx.planet, ctx.asteroid, d_idx, d_qx, d_qy, d_qz, d_m, d_type, step, d_hit_step, d_destroyed_step);
                                 
