@@ -6,7 +6,6 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-#include <chrono>
 #include <thread>
 #include <mutex>
 #include <hip/hip_runtime.h>
@@ -196,22 +195,22 @@ struct Data {
     int n, planet, asteroid;
 };
 
-void read_input(const char* filename, Data& sys) {
+void read_input(const char* filename, Data& ctx) {
     std::ifstream fin(filename);
-    fin >> sys.n >> sys.planet >> sys.asteroid;
-    sys.qx.resize(sys.n); sys.qy.resize(sys.n); sys.qz.resize(sys.n);
-    sys.vx.resize(sys.n); sys.vy.resize(sys.n); sys.vz.resize(sys.n);
-    sys.m.resize(sys.n); sys.type.resize(sys.n);
+    fin >> ctx.n >> ctx.planet >> ctx.asteroid;
+    ctx.qx.resize(ctx.n); ctx.qy.resize(ctx.n); ctx.qz.resize(ctx.n);
+    ctx.vx.resize(ctx.n); ctx.vy.resize(ctx.n); ctx.vz.resize(ctx.n);
+    ctx.m.resize(ctx.n); ctx.type.resize(ctx.n);
     
-    for (int i = 0; i < sys.n; i++) {
+    for (int i = 0; i < ctx.n; i++) {
         std::string t;
-        fin >> sys.qx[i] >> sys.qy[i] >> sys.qz[i] 
-            >> sys.vx[i] >> sys.vy[i] >> sys.vz[i] 
-            >> sys.m[i] >> t;
-        if (t == "planet") sys.type[i] = 0;
-        else if (t == "asteroid") sys.type[i] = 1;
-        else if (t == "device") sys.type[i] = 2;
-        else sys.type[i] = 3;
+        fin >> ctx.qx[i] >> ctx.qy[i] >> ctx.qz[i] 
+            >> ctx.vx[i] >> ctx.vy[i] >> ctx.vz[i] 
+            >> ctx.m[i] >> t;
+        if (t == "planet") ctx.type[i] = 0;
+        else if (t == "asteroid") ctx.type[i] = 1;
+        else if (t == "device") ctx.type[i] = 2;
+        else ctx.type[i] = 3;
     }
 }
 
@@ -244,29 +243,27 @@ int main(int argc, char** argv) {
         throw std::runtime_error("must supply 2 arguments");
     }
 
-    Data sys;
-    read_input(argv[1], sys);
+    Data ctx;
+    read_input(argv[1], ctx);
 
     std::vector<double> saved_qx, saved_qy, saved_qz, saved_vx, saved_vy, saved_vz, saved_m;
     std::vector<int> saved_type;
     int saved_step = -1;
     
-    saved_qx.resize(sys.n);
-    saved_qy.resize(sys.n);
-    saved_qz.resize(sys.n);
-    saved_vx.resize(sys.n);
-    saved_vy.resize(sys.n);
-    saved_vz.resize(sys.n);
-    saved_m.resize(sys.n);
-    saved_type.resize(sys.n);
-
-    auto p1_start = std::chrono::high_resolution_clock::now();
+    saved_qx.resize(ctx.n);
+    saved_qy.resize(ctx.n);
+    saved_qz.resize(ctx.n);
+    saved_vx.resize(ctx.n);
+    saved_vy.resize(ctx.n);
+    saved_vz.resize(ctx.n);
+    saved_m.resize(ctx.n);
+    saved_type.resize(ctx.n);
 
     // Problem 1 & 2
     double min_dist = std::numeric_limits<double>::infinity();
     int hit_time_step = -2;
 
-    std::thread t_p1([&]() {
+    std::thread p1([&]() {
         HIP_CHECK(hipSetDevice(0));
         setup_gpu_constants();
         
@@ -274,41 +271,41 @@ int main(int argc, char** argv) {
         int *d_type;
         double *d_min_dist;
         
-        HIP_CHECK(hipMalloc(&d_qx, sys.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_qy, sys.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_qz, sys.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_vx, sys.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_vy, sys.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_vz, sys.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_m, sys.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_type, sys.n * sizeof(int)));
+        HIP_CHECK(hipMalloc(&d_qx, ctx.n * sizeof(double)));
+        HIP_CHECK(hipMalloc(&d_qy, ctx.n * sizeof(double)));
+        HIP_CHECK(hipMalloc(&d_qz, ctx.n * sizeof(double)));
+        HIP_CHECK(hipMalloc(&d_vx, ctx.n * sizeof(double)));
+        HIP_CHECK(hipMalloc(&d_vy, ctx.n * sizeof(double)));
+        HIP_CHECK(hipMalloc(&d_vz, ctx.n * sizeof(double)));
+        HIP_CHECK(hipMalloc(&d_m, ctx.n * sizeof(double)));
+        HIP_CHECK(hipMalloc(&d_type, ctx.n * sizeof(int)));
         HIP_CHECK(hipMalloc(&d_min_dist, sizeof(double)));
 
         // Prepare data for Prob 1 (devices have mass 0)
-        std::vector<double> m_p1 = sys.m;
-        for(int i = 0; i < sys.n; i++) {
-            if(sys.type[i] == 2) m_p1[i] = 0;
+        std::vector<double> m_p1 = ctx.m;
+        for(int i = 0; i < ctx.n; i++) {
+            if(ctx.type[i] == 2) m_p1[i] = 0;
         }
         
-        HIP_CHECK(hipMemcpy(d_qx, sys.qx.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
-        HIP_CHECK(hipMemcpy(d_qy, sys.qy.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
-        HIP_CHECK(hipMemcpy(d_qz, sys.qz.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
-        HIP_CHECK(hipMemcpy(d_vx, sys.vx.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
-        HIP_CHECK(hipMemcpy(d_vy, sys.vy.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
-        HIP_CHECK(hipMemcpy(d_vz, sys.vz.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
-        HIP_CHECK(hipMemcpy(d_m, m_p1.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
-        HIP_CHECK(hipMemcpy(d_type, sys.type.data(), sys.n * sizeof(int), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(d_qx, ctx.qx.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(d_qy, ctx.qy.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(d_qz, ctx.qz.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(d_vx, ctx.vx.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(d_vy, ctx.vy.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(d_vz, ctx.vz.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(d_m, m_p1.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(d_type, ctx.type.data(), ctx.n * sizeof(int), hipMemcpyHostToDevice));
         
         double init_min_dist = std::numeric_limits<double>::infinity();
         HIP_CHECK(hipMemcpy(d_min_dist, &init_min_dist, sizeof(double), hipMemcpyHostToDevice));
 
         int blockSize = 256;
-        int numBlocks = (sys.n + blockSize - 1) / blockSize;
+        int numBlocks = (ctx.n + blockSize - 1) / blockSize;
         
         for (int step = 0; step <= param::n_steps; step++) {
             if (step > 0) {
-                run_step<<<numBlocks, blockSize>>>(sys.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_m, d_type, step * param::dt);
-                check_min_dist<<<1, 1>>>(sys.planet, sys.asteroid, d_qx, d_qy, d_qz, d_min_dist);
+                run_step<<<numBlocks, blockSize>>>(ctx.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_m, d_type, step * param::dt);
+                check_min_dist<<<1, 1>>>(ctx.planet, ctx.asteroid, d_qx, d_qy, d_qz, d_min_dist);
             }
         }
         
@@ -318,7 +315,7 @@ int main(int argc, char** argv) {
         HIP_CHECK(hipFree(d_m)); HIP_CHECK(hipFree(d_type)); HIP_CHECK(hipFree(d_min_dist));
     });
 
-    std::thread t_p2([&]() {
+    std::thread p2([&]() {
         HIP_CHECK(hipSetDevice(1));
         setup_gpu_constants();
         
@@ -329,52 +326,52 @@ int main(int argc, char** argv) {
         double *d_saved_qx, *d_saved_qy, *d_saved_qz, *d_saved_vx, *d_saved_vy, *d_saved_vz, *d_saved_m;
         int *d_saved_type, *d_saved_step;
         
-        HIP_CHECK(hipMalloc(&d_qx, sys.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_qy, sys.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_qz, sys.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_vx, sys.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_vy, sys.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_vz, sys.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_m, sys.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_m0, sys.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_type, sys.n * sizeof(int)));
+        HIP_CHECK(hipMalloc(&d_qx, ctx.n * sizeof(double)));
+        HIP_CHECK(hipMalloc(&d_qy, ctx.n * sizeof(double)));
+        HIP_CHECK(hipMalloc(&d_qz, ctx.n * sizeof(double)));
+        HIP_CHECK(hipMalloc(&d_vx, ctx.n * sizeof(double)));
+        HIP_CHECK(hipMalloc(&d_vy, ctx.n * sizeof(double)));
+        HIP_CHECK(hipMalloc(&d_vz, ctx.n * sizeof(double)));
+        HIP_CHECK(hipMalloc(&d_m, ctx.n * sizeof(double)));
+        HIP_CHECK(hipMalloc(&d_m0, ctx.n * sizeof(double)));
+        HIP_CHECK(hipMalloc(&d_type, ctx.n * sizeof(int)));
         HIP_CHECK(hipMalloc(&d_hit_step, sizeof(int)));
 
-        HIP_CHECK(hipMalloc(&d_saved_qx, sys.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_saved_qy, sys.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_saved_qz, sys.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_saved_vx, sys.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_saved_vy, sys.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_saved_vz, sys.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_saved_m, sys.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_saved_type, sys.n * sizeof(int)));
+        HIP_CHECK(hipMalloc(&d_saved_qx, ctx.n * sizeof(double)));
+        HIP_CHECK(hipMalloc(&d_saved_qy, ctx.n * sizeof(double)));
+        HIP_CHECK(hipMalloc(&d_saved_qz, ctx.n * sizeof(double)));
+        HIP_CHECK(hipMalloc(&d_saved_vx, ctx.n * sizeof(double)));
+        HIP_CHECK(hipMalloc(&d_saved_vy, ctx.n * sizeof(double)));
+        HIP_CHECK(hipMalloc(&d_saved_vz, ctx.n * sizeof(double)));
+        HIP_CHECK(hipMalloc(&d_saved_m, ctx.n * sizeof(double)));
+        HIP_CHECK(hipMalloc(&d_saved_type, ctx.n * sizeof(int)));
         HIP_CHECK(hipMalloc(&d_saved_step, sizeof(int)));
 
-        HIP_CHECK(hipMemcpy(d_qx, sys.qx.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
-        HIP_CHECK(hipMemcpy(d_qy, sys.qy.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
-        HIP_CHECK(hipMemcpy(d_qz, sys.qz.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
-        HIP_CHECK(hipMemcpy(d_vx, sys.vx.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
-        HIP_CHECK(hipMemcpy(d_vy, sys.vy.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
-        HIP_CHECK(hipMemcpy(d_vz, sys.vz.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
-        HIP_CHECK(hipMemcpy(d_m, sys.m.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
-        HIP_CHECK(hipMemcpy(d_m0, sys.m.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
-        HIP_CHECK(hipMemcpy(d_type, sys.type.data(), sys.n * sizeof(int), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(d_qx, ctx.qx.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(d_qy, ctx.qy.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(d_qz, ctx.qz.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(d_vx, ctx.vx.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(d_vy, ctx.vy.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(d_vz, ctx.vz.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(d_m, ctx.m.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(d_m0, ctx.m.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(d_type, ctx.type.data(), ctx.n * sizeof(int), hipMemcpyHostToDevice));
         
         int init_hit_step = -1;
         HIP_CHECK(hipMemcpy(d_hit_step, &init_hit_step, sizeof(int), hipMemcpyHostToDevice));
         HIP_CHECK(hipMemcpy(d_saved_step, &init_hit_step, sizeof(int), hipMemcpyHostToDevice));
         
         int blockSize = 256;
-        int numBlocks = (sys.n + blockSize - 1) / blockSize;
+        int numBlocks = (ctx.n + blockSize - 1) / blockSize;
 
         for (int step = 0; step <= param::n_steps; step++) {
             if (step > 0) {
-                update_mass<<<numBlocks, blockSize>>>(sys.n, d_m, d_m0, d_type, step * param::dt);
-                run_step<<<numBlocks, blockSize>>>(sys.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_m, d_type, step * param::dt);
+                update_mass<<<numBlocks, blockSize>>>(ctx.n, d_m, d_m0, d_type, step * param::dt);
+                run_step<<<numBlocks, blockSize>>>(ctx.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_m, d_type, step * param::dt);
             }
-            check_collision<<<1, 1>>>(sys.planet, sys.asteroid, d_qx, d_qy, d_qz, d_hit_step, step);
-            check_any_device_hit<<<numBlocks, blockSize>>>(sys.n, sys.planet, d_qx, d_qy, d_qz, d_type, step, d_saved_step);
-            save_state<<<numBlocks, blockSize>>>(sys.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_m, d_type, step, d_saved_step,
+            check_collision<<<1, 1>>>(ctx.planet, ctx.asteroid, d_qx, d_qy, d_qz, d_hit_step, step);
+            check_any_device_hit<<<numBlocks, blockSize>>>(ctx.n, ctx.planet, d_qx, d_qy, d_qz, d_type, step, d_saved_step);
+            save_state<<<numBlocks, blockSize>>>(ctx.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_m, d_type, step, d_saved_step,
                 d_saved_qx, d_saved_qy, d_saved_qz, d_saved_vx, d_saved_vy, d_saved_vz, d_saved_m, d_saved_type);
                     
             if (step % 2000 == 0) {
@@ -393,14 +390,14 @@ int main(int argc, char** argv) {
 
         HIP_CHECK(hipMemcpy(&saved_step, d_saved_step, sizeof(int), hipMemcpyDeviceToHost));
         if (saved_step != -1) {
-            HIP_CHECK(hipMemcpy(saved_qx.data(), d_saved_qx, sys.n * sizeof(double), hipMemcpyDeviceToHost));
-            HIP_CHECK(hipMemcpy(saved_qy.data(), d_saved_qy, sys.n * sizeof(double), hipMemcpyDeviceToHost));
-            HIP_CHECK(hipMemcpy(saved_qz.data(), d_saved_qz, sys.n * sizeof(double), hipMemcpyDeviceToHost));
-            HIP_CHECK(hipMemcpy(saved_vx.data(), d_saved_vx, sys.n * sizeof(double), hipMemcpyDeviceToHost));
-            HIP_CHECK(hipMemcpy(saved_vy.data(), d_saved_vy, sys.n * sizeof(double), hipMemcpyDeviceToHost));
-            HIP_CHECK(hipMemcpy(saved_vz.data(), d_saved_vz, sys.n * sizeof(double), hipMemcpyDeviceToHost));
-            HIP_CHECK(hipMemcpy(saved_m.data(), d_saved_m, sys.n * sizeof(double), hipMemcpyDeviceToHost));
-            HIP_CHECK(hipMemcpy(saved_type.data(), d_saved_type, sys.n * sizeof(int), hipMemcpyDeviceToHost));
+            HIP_CHECK(hipMemcpy(saved_qx.data(), d_saved_qx, ctx.n * sizeof(double), hipMemcpyDeviceToHost));
+            HIP_CHECK(hipMemcpy(saved_qy.data(), d_saved_qy, ctx.n * sizeof(double), hipMemcpyDeviceToHost));
+            HIP_CHECK(hipMemcpy(saved_qz.data(), d_saved_qz, ctx.n * sizeof(double), hipMemcpyDeviceToHost));
+            HIP_CHECK(hipMemcpy(saved_vx.data(), d_saved_vx, ctx.n * sizeof(double), hipMemcpyDeviceToHost));
+            HIP_CHECK(hipMemcpy(saved_vy.data(), d_saved_vy, ctx.n * sizeof(double), hipMemcpyDeviceToHost));
+            HIP_CHECK(hipMemcpy(saved_vz.data(), d_saved_vz, ctx.n * sizeof(double), hipMemcpyDeviceToHost));
+            HIP_CHECK(hipMemcpy(saved_m.data(), d_saved_m, ctx.n * sizeof(double), hipMemcpyDeviceToHost));
+            HIP_CHECK(hipMemcpy(saved_type.data(), d_saved_type, ctx.n * sizeof(int), hipMemcpyDeviceToHost));
         }
         
         HIP_CHECK(hipFree(d_qx)); HIP_CHECK(hipFree(d_qy)); HIP_CHECK(hipFree(d_qz));
@@ -411,11 +408,8 @@ int main(int argc, char** argv) {
         HIP_CHECK(hipFree(d_saved_m)); HIP_CHECK(hipFree(d_saved_type)); HIP_CHECK(hipFree(d_saved_step));
     });
 
-    t_p1.join();
-    t_p2.join();
-    
-    auto p2_end = std::chrono::high_resolution_clock::now();
-    std::cerr << "Problem 1 & 2 time: " << std::chrono::duration<double>(p2_end - p1_start).count() << "s\n";
+    p1.join();
+    p2.join();
 
     // Problem 3
     int gravity_device_id = -1;
@@ -423,8 +417,8 @@ int main(int argc, char** argv) {
 
     // Identify devices
     std::vector<int> devices;
-    for(int i=0; i<sys.n; ++i) {
-        if(sys.type[i] == 2) devices.push_back(i);
+    for(int i=0; i<ctx.n; ++i) {
+        if(ctx.type[i] == 2) devices.push_back(i);
     }
 
     double best_cost = std::numeric_limits<double>::infinity();
@@ -436,47 +430,47 @@ int main(int argc, char** argv) {
         setup_gpu_constants();
 
         int blockSize = 256;
-        int numBlocks = (sys.n + blockSize - 1) / blockSize;
+        int numBlocks = (ctx.n + blockSize - 1) / blockSize;
 
         double *d_qx, *d_qy, *d_qz, *d_vx, *d_vy, *d_vz, *d_m, *d_m0;
         int *d_type;
         int *d_hit_step, *d_destroyed_step;
         
-        HIP_CHECK(hipMalloc(&d_qx, sys.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_qy, sys.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_qz, sys.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_vx, sys.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_vy, sys.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_vz, sys.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_m, sys.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_m0, sys.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_type, sys.n * sizeof(int)));
+        HIP_CHECK(hipMalloc(&d_qx, ctx.n * sizeof(double)));
+        HIP_CHECK(hipMalloc(&d_qy, ctx.n * sizeof(double)));
+        HIP_CHECK(hipMalloc(&d_qz, ctx.n * sizeof(double)));
+        HIP_CHECK(hipMalloc(&d_vx, ctx.n * sizeof(double)));
+        HIP_CHECK(hipMalloc(&d_vy, ctx.n * sizeof(double)));
+        HIP_CHECK(hipMalloc(&d_vz, ctx.n * sizeof(double)));
+        HIP_CHECK(hipMalloc(&d_m, ctx.n * sizeof(double)));
+        HIP_CHECK(hipMalloc(&d_m0, ctx.n * sizeof(double)));
+        HIP_CHECK(hipMalloc(&d_type, ctx.n * sizeof(int)));
         HIP_CHECK(hipMalloc(&d_hit_step, sizeof(int)));
         HIP_CHECK(hipMalloc(&d_destroyed_step, sizeof(int)));
 
-        HIP_CHECK(hipMemcpy(d_m0, sys.m.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(d_m0, ctx.m.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
 
         for (int d_idx : device_subset) {
             int start_step = 0;
             if (saved_step != -1) {
                 start_step = saved_step;
-                HIP_CHECK(hipMemcpy(d_qx, saved_qx.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
-                HIP_CHECK(hipMemcpy(d_qy, saved_qy.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
-                HIP_CHECK(hipMemcpy(d_qz, saved_qz.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
-                HIP_CHECK(hipMemcpy(d_vx, saved_vx.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
-                HIP_CHECK(hipMemcpy(d_vy, saved_vy.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
-                HIP_CHECK(hipMemcpy(d_vz, saved_vz.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
-                HIP_CHECK(hipMemcpy(d_m, saved_m.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
-                HIP_CHECK(hipMemcpy(d_type, saved_type.data(), sys.n * sizeof(int), hipMemcpyHostToDevice));
+                HIP_CHECK(hipMemcpy(d_qx, saved_qx.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+                HIP_CHECK(hipMemcpy(d_qy, saved_qy.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+                HIP_CHECK(hipMemcpy(d_qz, saved_qz.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+                HIP_CHECK(hipMemcpy(d_vx, saved_vx.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+                HIP_CHECK(hipMemcpy(d_vy, saved_vy.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+                HIP_CHECK(hipMemcpy(d_vz, saved_vz.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+                HIP_CHECK(hipMemcpy(d_m, saved_m.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+                HIP_CHECK(hipMemcpy(d_type, saved_type.data(), ctx.n * sizeof(int), hipMemcpyHostToDevice));
             } else {
-                HIP_CHECK(hipMemcpy(d_qx, sys.qx.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
-                HIP_CHECK(hipMemcpy(d_qy, sys.qy.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
-                HIP_CHECK(hipMemcpy(d_qz, sys.qz.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
-                HIP_CHECK(hipMemcpy(d_vx, sys.vx.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
-                HIP_CHECK(hipMemcpy(d_vy, sys.vy.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
-                HIP_CHECK(hipMemcpy(d_vz, sys.vz.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
-                HIP_CHECK(hipMemcpy(d_m, sys.m.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
-                HIP_CHECK(hipMemcpy(d_type, sys.type.data(), sys.n * sizeof(int), hipMemcpyHostToDevice));
+                HIP_CHECK(hipMemcpy(d_qx, ctx.qx.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+                HIP_CHECK(hipMemcpy(d_qy, ctx.qy.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+                HIP_CHECK(hipMemcpy(d_qz, ctx.qz.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+                HIP_CHECK(hipMemcpy(d_vx, ctx.vx.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+                HIP_CHECK(hipMemcpy(d_vy, ctx.vy.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+                HIP_CHECK(hipMemcpy(d_vz, ctx.vz.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+                HIP_CHECK(hipMemcpy(d_m, ctx.m.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+                HIP_CHECK(hipMemcpy(d_type, ctx.type.data(), ctx.n * sizeof(int), hipMemcpyHostToDevice));
             }
             
             int init_val = -1;
@@ -485,11 +479,11 @@ int main(int argc, char** argv) {
 
             for (int step = start_step; step <= param::n_steps; step++) {
                 if (step > start_step) {
-                    update_mass<<<numBlocks, blockSize>>>(sys.n, d_m, d_m0, d_type, step * param::dt);
-                    run_step<<<numBlocks, blockSize>>>(sys.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_m, d_type, step * param::dt);
+                    update_mass<<<numBlocks, blockSize>>>(ctx.n, d_m, d_m0, d_type, step * param::dt);
+                    run_step<<<numBlocks, blockSize>>>(ctx.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_m, d_type, step * param::dt);
                 }
-                check_device_hit<<<1, 1>>>(sys.planet, d_idx, d_qx, d_qy, d_qz, d_m, d_type, step, d_destroyed_step);
-                check_collision<<<1, 1>>>(sys.planet, sys.asteroid, d_qx, d_qy, d_qz, d_hit_step, step);
+                check_device_hit<<<1, 1>>>(ctx.planet, d_idx, d_qx, d_qy, d_qz, d_m, d_type, step, d_destroyed_step);
+                check_collision<<<1, 1>>>(ctx.planet, ctx.asteroid, d_qx, d_qy, d_qz, d_hit_step, step);
                                 
                 if (step % 2000 == 0) {
                     int h_hit;
@@ -524,14 +518,14 @@ int main(int argc, char** argv) {
 
     std::vector<int> devices0, devices1;
     for (int i = 0; i < devices.size(); ++i) {
-        if (i & 1) devices0.push_back(devices[i]);
-        else devices1.push_back(devices[i]);
+        if (i & 1) devices1.push_back(devices[i]);
+        else devices0.push_back(devices[i]);
     }
 
-    std::thread t0_p3(worker, 0, devices0);
-    std::thread t1_p3(worker, 1, devices1);
-    t0_p3.join();
-    t1_p3.join();
+    std::thread p3_0(worker, 0, devices0);
+    std::thread p3_1(worker, 1, devices1);
+    p3_0.join();
+    p3_1.join();
 
     if (best_id != -1) {
         gravity_device_id = best_id;
@@ -540,9 +534,5 @@ int main(int argc, char** argv) {
 
     write_output(argv[2], min_dist, hit_time_step, gravity_device_id, missile_cost);
     
-    auto p3_end = std::chrono::high_resolution_clock::now();
-    std::cerr << "Problem 3 time: " << std::chrono::duration<double>(p3_end - p2_end).count() << "s\n";
-    std::cerr << "Total time: " << std::chrono::duration<double>(p3_end - p1_start).count() << "s\n";
-
     return 0;
 }
