@@ -50,8 +50,17 @@ __global__ void check_min_dist(int planet, int asteroid, double* qx, double* qy,
 
 __global__ void run_step(int n, double* qx, double* qy, double* qz,
                                         double* vx, double* vy, double* vz,
-                                        double* m, double* m0, int* type, double t) {
+                                        double* m, double* m0, int* type, double t,
+                                        int planet, int asteroid, double* min_dist) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (min_dist != nullptr && i == 0) {
+        double dx = qx[planet] - qx[asteroid];
+        double dy = qy[planet] - qy[asteroid];
+        double dz = qz[planet] - qz[asteroid];
+        double dist = sqrt(dx * dx + dy * dy + dz * dz);
+        atomicMin(min_dist, dist);
+    }
     
     double ax = 0.0, ay = 0.0, az = 0.0;
     double cur_qx, cur_qy, cur_qz;
@@ -309,10 +318,10 @@ int main(int argc, char** argv) {
         
         for (int step = 0; step <= param::n_steps; step++) {
             if (step > 0) {
-                run_step<<<numBlocks, blockSize>>>(ctx.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_m, nullptr, d_type, step * param::dt);
-                check_min_dist<<<1, 1>>>(ctx.planet, ctx.asteroid, d_qx, d_qy, d_qz, d_min_dist);
+                run_step<<<numBlocks, blockSize>>>(ctx.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_m, nullptr, d_type, step * param::dt, ctx.planet, ctx.asteroid, d_min_dist);
             }
         }
+        check_min_dist<<<1, 1>>>(ctx.planet, ctx.asteroid, d_qx, d_qy, d_qz, d_min_dist);
         
         HIP_CHECK(hipMemcpy(&min_dist, d_min_dist, sizeof(double), hipMemcpyDeviceToHost));
         HIP_CHECK(hipFree(d_qx)); HIP_CHECK(hipFree(d_qy)); HIP_CHECK(hipFree(d_qz));
@@ -370,7 +379,7 @@ int main(int argc, char** argv) {
 
         for (int step = 0; step <= param::n_steps; step++) {
             if (step > 0) {
-                run_step<<<numBlocks, blockSize>>>(ctx.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_m, d_m0, d_type, step * param::dt);
+                run_step<<<numBlocks, blockSize>>>(ctx.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_m, d_m0, d_type, step * param::dt, 0, 0, nullptr);
             }
             check_hits<<<numBlocks, blockSize>>>(ctx.n, ctx.planet, ctx.asteroid, d_qx, d_qy, d_qz, d_type, step, d_saved_step, d_hit_step);
             save_state<<<numBlocks, blockSize>>>(ctx.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_m, d_type, step, d_saved_step,
@@ -481,7 +490,7 @@ int main(int argc, char** argv) {
 
             for (int step = start_step; step <= param::n_steps; step++) {
                 if (step > start_step) {
-                    run_step<<<numBlocks, blockSize>>>(ctx.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_m, d_m0, d_type, step * param::dt);
+                    run_step<<<numBlocks, blockSize>>>(ctx.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_m, d_m0, d_type, step * param::dt, 0, 0, nullptr);
                 }
                 check_hit_and_destroy<<<1, 1>>>(ctx.planet, ctx.asteroid, d_idx, d_qx, d_qy, d_qz, d_m, d_type, step, d_hit_step, d_destroyed_step);
                                 
