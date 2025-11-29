@@ -36,6 +36,13 @@ __constant__ double d_G;
 __constant__ double d_planet_radius;
 __constant__ double d_missile_speed;
 
+__global__ void update_mass(int n, double* m, double* m0, int* type, double t) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n && type[i] == 2) {
+        m[i] = m0[i] + 0.5 * m0[i] * fabs(sin(t / 6000.0));
+    }
+}
+
 __global__ void check_min_dist(int planet, int asteroid, double* qx, double* qy, double* qz, double* min_dist) {
     if (threadIdx.x == 0) {
         double dx = qx[planet] - qx[asteroid];
@@ -51,7 +58,7 @@ __global__ void check_min_dist(int planet, int asteroid, double* qx, double* qy,
 __global__ void run_step(int n, double* in_qx, double* in_qy, double* in_qz,
                                         double* vx, double* vy, double* vz,
                                         double* out_qx, double* out_qy, double* out_qz,
-                                        double* m, double* m0, int* type, double t,
+                                        double* m, double t,
                                         int planet, int asteroid, double* min_dist) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -70,11 +77,6 @@ __global__ void run_step(int n, double* in_qx, double* in_qy, double* in_qz,
         cur_qx = in_qx[i];
         cur_qy = in_qy[i];
         cur_qz = in_qz[i];
-    }
-
-    if (i < n && m0 != nullptr && type[i] == 2) {
-        double tmp = m0[i];
-        m[i] = tmp + 0.5 * tmp * fabs(sin(t / 6000.0));
     }
 
     __shared__ double s_qx[256];
@@ -334,7 +336,7 @@ int main(int argc, char** argv) {
                 run_step<<<numBlocks, blockSize>>>(ctx.n, 
                     d_qx[in], d_qy[in], d_qz[in], d_vx, d_vy, d_vz,
                     d_qx[out], d_qy[out], d_qz[out],
-                    d_m, nullptr, d_type, step * param::dt, ctx.planet, ctx.asteroid, d_min_dist);
+                    d_m, step * param::dt, ctx.planet, ctx.asteroid, d_min_dist);
                 std::swap(in, out);
             }
         }
@@ -406,10 +408,11 @@ int main(int argc, char** argv) {
 
         for (int step = 0; step <= param::n_steps; step++) {
             if (step > 0) {
+                update_mass<<<numBlocks, blockSize>>>(ctx.n, d_m, d_m0, d_type, step * param::dt);
                 run_step<<<numBlocks, blockSize>>>(ctx.n, 
                     d_qx[in], d_qy[in], d_qz[in], d_vx, d_vy, d_vz,
                     d_qx[out], d_qy[out], d_qz[out],
-                    d_m, d_m0, d_type, step * param::dt, 0, 0, nullptr);
+                    d_m, step * param::dt, 0, 0, nullptr);
                 std::swap(in, out);
             }
             check_hits<<<numBlocks, blockSize>>>(ctx.n, ctx.planet, ctx.asteroid, d_qx[in], d_qy[in], d_qz[in], d_type, step, d_saved_step, d_hit_step);
@@ -531,10 +534,11 @@ int main(int argc, char** argv) {
 
             for (int step = start_step; step <= param::n_steps; step++) {
                 if (step > start_step) {
+                    update_mass<<<numBlocks, blockSize>>>(ctx.n, d_m, d_m0, d_type, step * param::dt);
                     run_step<<<numBlocks, blockSize>>>(ctx.n, 
                         d_qx[in], d_qy[in], d_qz[in], d_vx, d_vy, d_vz,
                         d_qx[out], d_qy[out], d_qz[out],
-                        d_m, d_m0, d_type, step * param::dt, 0, 0, nullptr);
+                        d_m, step * param::dt, 0, 0, nullptr);
                     std::swap(in, out);
                 }
                 check_hit_and_destroy<<<1, 1>>>(ctx.planet, ctx.asteroid, d_idx, d_qx[in], d_qy[in], d_qz[in], d_m, d_type, step, d_hit_step, d_destroyed_step);
