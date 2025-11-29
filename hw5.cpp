@@ -41,7 +41,7 @@ __device__ __forceinline__ double gravity_device_mass(double m0, double t) {
     return m0 + 0.5 * m0 * fabs(sin(t / 6000.0));
 }
 
-__global__ void check_min_dist_kernel(int planet, int asteroid, double* qx, double* qy, double* qz, double* min_dist) {
+__global__ void check_min_dist(int planet, int asteroid, double* qx, double* qy, double* qz, double* min_dist) {
     if (threadIdx.x == 0) {
         double dx = qx[planet] - qx[asteroid];
         double dy = qy[planet] - qy[asteroid];
@@ -53,7 +53,7 @@ __global__ void check_min_dist_kernel(int planet, int asteroid, double* qx, doub
     }
 }
 
-__global__ void update_mass_kernel(int n, double* m, double* m0, int* type, double t) {
+__global__ void update_mass(int n, double* m, double* m0, int* type, double t) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n && type[i] == 2) {
         m[i] = gravity_device_mass(m0[i], t);
@@ -78,7 +78,6 @@ __global__ void run_step(int n, double* qx, double* qy, double* qz,
     __shared__ double s_qy[256];
     __shared__ double s_qz[256];
     __shared__ double s_m[256];
-    __shared__ int s_type[256];
 
     for (int tile = 0; tile < n; tile += blockDim.x) {
         int idx = tile + threadIdx.x;
@@ -87,7 +86,6 @@ __global__ void run_step(int n, double* qx, double* qy, double* qz,
             s_qy[threadIdx.x] = qy[idx];
             s_qz[threadIdx.x] = qz[idx];
             s_m[threadIdx.x] = m[idx];
-            s_type[threadIdx.x] = type[idx];
         }
         __syncthreads();
 
@@ -117,17 +115,13 @@ __global__ void run_step(int n, double* qx, double* qy, double* qz,
     }
 
     if (i < n) {
-        vx[i] += ax * d_dt;
-        vy[i] += ay * d_dt;
-        vz[i] += az * d_dt;
-
-        qx[i] += vx[i] * d_dt;
-        qy[i] += vy[i] * d_dt;
-        qz[i] += vz[i] * d_dt;
+        vx[i] += ax * d_dt; qx[i] += vx[i] * d_dt;
+        vy[i] += ay * d_dt; qy[i] += vy[i] * d_dt;
+        vz[i] += az * d_dt; qz[i] += vz[i] * d_dt;
     }
 }
 
-__global__ void check_collision_kernel(int planet, int asteroid, double* qx, double* qy, double* qz, int* hit_step, int step) {
+__global__ void check_collision(int planet, int asteroid, double* qx, double* qy, double* qz, int* hit_step, int step) {
     if (threadIdx.x == 0) {
         // Only update if not already hit
         if (*hit_step == -1) {
@@ -141,7 +135,7 @@ __global__ void check_collision_kernel(int planet, int asteroid, double* qx, dou
     }
 }
 
-__global__ void check_any_missile_hit_kernel(int n, int planet, double* qx, double* qy, double* qz, int* type, int step, int* saved_step) {
+__global__ void check_any_device_hit(int n, int planet, double* qx, double* qy, double* qz, int* type, int step, int* saved_step) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n && type[i] == 2) {
         if (*saved_step != -1) return;
@@ -158,7 +152,7 @@ __global__ void check_any_missile_hit_kernel(int n, int planet, double* qx, doub
     }
 }
 
-__global__ void save_state_kernel(int n, double* qx, double* qy, double* qz,
+__global__ void save_state(int n, double* qx, double* qy, double* qz,
                                   double* vx, double* vy, double* vz,
                                   double* m, int* type, int step, int* saved_step,
                                   double* s_qx, double* s_qy, double* s_qz,
@@ -179,7 +173,7 @@ __global__ void save_state_kernel(int n, double* qx, double* qy, double* qz,
     }
 }
 
-__global__ void check_missile_kernel(int planet, int target_device, double* qx, double* qy, double* qz, 
+__global__ void check_device_hit(int planet, int target_device, double* qx, double* qy, double* qz, 
                                      double* m, int* type, int step, int* destroyed_step) {
     if (threadIdx.x == 0 && *destroyed_step == -1) {
         double dx = qx[planet] - qx[target_device];
@@ -314,7 +308,7 @@ int main(int argc, char** argv) {
         for (int step = 0; step <= param::n_steps; step++) {
             if (step > 0) {
                 run_step<<<numBlocks, blockSize>>>(sys.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_m, d_type, step * param::dt);
-                check_min_dist_kernel<<<1, 1>>>(sys.planet, sys.asteroid, d_qx, d_qy, d_qz, d_min_dist);
+                check_min_dist<<<1, 1>>>(sys.planet, sys.asteroid, d_qx, d_qy, d_qz, d_min_dist);
             }
         }
         
@@ -375,12 +369,12 @@ int main(int argc, char** argv) {
 
         for (int step = 0; step <= param::n_steps; step++) {
             if (step > 0) {
-                update_mass_kernel<<<numBlocks, blockSize>>>(sys.n, d_m, d_m0, d_type, step * param::dt);
+                update_mass<<<numBlocks, blockSize>>>(sys.n, d_m, d_m0, d_type, step * param::dt);
                 run_step<<<numBlocks, blockSize>>>(sys.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_m, d_type, step * param::dt);
             }
-            check_collision_kernel<<<1, 1>>>(sys.planet, sys.asteroid, d_qx, d_qy, d_qz, d_hit_step, step);
-            check_any_missile_hit_kernel<<<numBlocks, blockSize>>>(sys.n, sys.planet, d_qx, d_qy, d_qz, d_type, step, d_saved_step);
-            save_state_kernel<<<numBlocks, blockSize>>>(sys.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_m, d_type, step, d_saved_step,
+            check_collision<<<1, 1>>>(sys.planet, sys.asteroid, d_qx, d_qy, d_qz, d_hit_step, step);
+            check_any_device_hit<<<numBlocks, blockSize>>>(sys.n, sys.planet, d_qx, d_qy, d_qz, d_type, step, d_saved_step);
+            save_state<<<numBlocks, blockSize>>>(sys.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_m, d_type, step, d_saved_step,
                 d_saved_qx, d_saved_qy, d_saved_qz, d_saved_vx, d_saved_vy, d_saved_vz, d_saved_m, d_saved_type);
                     
             if (step % 2000 == 0) {
@@ -491,11 +485,11 @@ int main(int argc, char** argv) {
 
             for (int step = start_step; step <= param::n_steps; step++) {
                 if (step > start_step) {
-                    update_mass_kernel<<<numBlocks, blockSize>>>(sys.n, d_m, d_m0, d_type, step * param::dt);
+                    update_mass<<<numBlocks, blockSize>>>(sys.n, d_m, d_m0, d_type, step * param::dt);
                     run_step<<<numBlocks, blockSize>>>(sys.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_m, d_type, step * param::dt);
                 }
-                check_missile_kernel<<<1, 1>>>(sys.planet, d_idx, d_qx, d_qy, d_qz, d_m, d_type, step, d_destroyed_step);
-                check_collision_kernel<<<1, 1>>>(sys.planet, sys.asteroid, d_qx, d_qy, d_qz, d_hit_step, step);
+                check_device_hit<<<1, 1>>>(sys.planet, d_idx, d_qx, d_qy, d_qz, d_m, d_type, step, d_destroyed_step);
+                check_collision<<<1, 1>>>(sys.planet, sys.asteroid, d_qx, d_qy, d_qz, d_hit_step, step);
                                 
                 if (step % 2000 == 0) {
                     int h_hit;
