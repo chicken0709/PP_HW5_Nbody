@@ -53,6 +53,13 @@ __global__ void check_min_dist_kernel(int planet, int asteroid, double* qx, doub
     }
 }
 
+__global__ void update_mass_kernel(int n, double* m, double* m0, int* type, double t) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n && type[i] == 2) {
+        m[i] = gravity_device_mass(m0[i], t);
+    }
+}
+
 __global__ void run_step(int n, double* qx, double* qy, double* qz,
                                         double* vx, double* vy, double* vz,
                                         double* m, int* type, double t) {
@@ -91,9 +98,6 @@ __global__ void run_step(int n, double* qx, double* qy, double* qz,
                 if (i == global_j) continue;
 
                 double mj = s_m[j];
-                if (s_type[j] == 2) {
-                    mj = gravity_device_mass(mj, t);
-                }
                 
                 double dx = s_qx[j] - my_qx;
                 double dy = s_qy[j] - my_qy;
@@ -324,7 +328,7 @@ int main(int argc, char** argv) {
         HIP_CHECK(hipSetDevice(1));
         setup_gpu_constants();
         
-        double *d_qx, *d_qy, *d_qz, *d_vx, *d_vy, *d_vz, *d_m;
+        double *d_qx, *d_qy, *d_qz, *d_vx, *d_vy, *d_vz, *d_m, *d_m0;
         int *d_type;
         int *d_hit_step;
         
@@ -338,6 +342,7 @@ int main(int argc, char** argv) {
         HIP_CHECK(hipMalloc(&d_vy, sys.n * sizeof(double)));
         HIP_CHECK(hipMalloc(&d_vz, sys.n * sizeof(double)));
         HIP_CHECK(hipMalloc(&d_m, sys.n * sizeof(double)));
+        HIP_CHECK(hipMalloc(&d_m0, sys.n * sizeof(double)));
         HIP_CHECK(hipMalloc(&d_type, sys.n * sizeof(int)));
         HIP_CHECK(hipMalloc(&d_hit_step, sizeof(int)));
 
@@ -358,6 +363,7 @@ int main(int argc, char** argv) {
         HIP_CHECK(hipMemcpy(d_vy, sys.vy.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
         HIP_CHECK(hipMemcpy(d_vz, sys.vz.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
         HIP_CHECK(hipMemcpy(d_m, sys.m.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(d_m0, sys.m.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
         HIP_CHECK(hipMemcpy(d_type, sys.type.data(), sys.n * sizeof(int), hipMemcpyHostToDevice));
         
         int init_hit_step = -1;
@@ -369,6 +375,7 @@ int main(int argc, char** argv) {
 
         for (int step = 0; step <= param::n_steps; step++) {
             if (step > 0) {
+                update_mass_kernel<<<numBlocks, blockSize>>>(sys.n, d_m, d_m0, d_type, step * param::dt);
                 run_step<<<numBlocks, blockSize>>>(sys.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_m, d_type, step * param::dt);
             }
             check_collision_kernel<<<1, 1>>>(sys.planet, sys.asteroid, d_qx, d_qy, d_qz, d_hit_step, step);
@@ -404,7 +411,7 @@ int main(int argc, char** argv) {
         
         HIP_CHECK(hipFree(d_qx)); HIP_CHECK(hipFree(d_qy)); HIP_CHECK(hipFree(d_qz));
         HIP_CHECK(hipFree(d_vx)); HIP_CHECK(hipFree(d_vy)); HIP_CHECK(hipFree(d_vz));
-        HIP_CHECK(hipFree(d_m)); HIP_CHECK(hipFree(d_type)); HIP_CHECK(hipFree(d_hit_step));
+        HIP_CHECK(hipFree(d_m)); HIP_CHECK(hipFree(d_m0)); HIP_CHECK(hipFree(d_type)); HIP_CHECK(hipFree(d_hit_step));
         HIP_CHECK(hipFree(d_saved_qx)); HIP_CHECK(hipFree(d_saved_qy)); HIP_CHECK(hipFree(d_saved_qz));
         HIP_CHECK(hipFree(d_saved_vx)); HIP_CHECK(hipFree(d_saved_vy)); HIP_CHECK(hipFree(d_saved_vz));
         HIP_CHECK(hipFree(d_saved_m)); HIP_CHECK(hipFree(d_saved_type)); HIP_CHECK(hipFree(d_saved_step));
@@ -437,7 +444,7 @@ int main(int argc, char** argv) {
         int blockSize = 256;
         int numBlocks = (sys.n + blockSize - 1) / blockSize;
 
-        double *d_qx, *d_qy, *d_qz, *d_vx, *d_vy, *d_vz, *d_m;
+        double *d_qx, *d_qy, *d_qz, *d_vx, *d_vy, *d_vz, *d_m, *d_m0;
         int *d_type;
         int *d_hit_step, *d_destroyed_step;
         
@@ -448,9 +455,12 @@ int main(int argc, char** argv) {
         HIP_CHECK(hipMalloc(&d_vy, sys.n * sizeof(double)));
         HIP_CHECK(hipMalloc(&d_vz, sys.n * sizeof(double)));
         HIP_CHECK(hipMalloc(&d_m, sys.n * sizeof(double)));
+        HIP_CHECK(hipMalloc(&d_m0, sys.n * sizeof(double)));
         HIP_CHECK(hipMalloc(&d_type, sys.n * sizeof(int)));
         HIP_CHECK(hipMalloc(&d_hit_step, sizeof(int)));
         HIP_CHECK(hipMalloc(&d_destroyed_step, sizeof(int)));
+
+        HIP_CHECK(hipMemcpy(d_m0, sys.m.data(), sys.n * sizeof(double), hipMemcpyHostToDevice));
 
         for (int d_idx : device_subset) {
             int start_step = 0;
@@ -481,6 +491,7 @@ int main(int argc, char** argv) {
 
             for (int step = start_step; step <= param::n_steps; step++) {
                 if (step > start_step) {
+                    update_mass_kernel<<<numBlocks, blockSize>>>(sys.n, d_m, d_m0, d_type, step * param::dt);
                     run_step<<<numBlocks, blockSize>>>(sys.n, d_qx, d_qy, d_qz, d_vx, d_vy, d_vz, d_m, d_type, step * param::dt);
                 }
                 check_missile_kernel<<<1, 1>>>(sys.planet, d_idx, d_qx, d_qy, d_qz, d_m, d_type, step, d_destroyed_step);
@@ -513,7 +524,7 @@ int main(int argc, char** argv) {
         
         HIP_CHECK(hipFree(d_qx)); HIP_CHECK(hipFree(d_qy)); HIP_CHECK(hipFree(d_qz));
         HIP_CHECK(hipFree(d_vx)); HIP_CHECK(hipFree(d_vy)); HIP_CHECK(hipFree(d_vz));
-        HIP_CHECK(hipFree(d_m)); HIP_CHECK(hipFree(d_type));
+        HIP_CHECK(hipFree(d_m)); HIP_CHECK(hipFree(d_m0)); HIP_CHECK(hipFree(d_type));
         HIP_CHECK(hipFree(d_hit_step)); HIP_CHECK(hipFree(d_destroyed_step));
     };
 
