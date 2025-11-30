@@ -39,7 +39,7 @@ __constant__ double d_missile_speed;
 __global__ void update_mass(int n, double* m, double* m0, int* type, double t) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n && type[i] == 2) {
-        double tmp = __ldg(&m0[i]);
+        double tmp = m0[i];
         m[i] = tmp + 0.5 * tmp * fabs(sin(t / 6000.0));
     }
 }
@@ -73,9 +73,9 @@ __global__ void run_step(int n, double* in_qx, double* in_qy, double* in_qz,
     double cur_qx, cur_qy, cur_qz, cur_vx, cur_vy, cur_vz;
 
     if (i < n) {
-        cur_qx = __ldg(&in_qx[i]);
-        cur_qy = __ldg(&in_qy[i]);
-        cur_qz = __ldg(&in_qz[i]);
+        cur_qx = in_qx[i];
+        cur_qy = in_qy[i];
+        cur_qz = in_qz[i];
     }
 
     __shared__ double s_qx[256];
@@ -86,10 +86,10 @@ __global__ void run_step(int n, double* in_qx, double* in_qy, double* in_qz,
     for (int tile = 0; tile < n; tile += blockDim.x) {
         int idx = tile + threadIdx.x;
         if (idx < n) {
-            s_qx[threadIdx.x] = __ldg(&in_qx[idx]);
-            s_qy[threadIdx.x] = __ldg(&in_qy[idx]);
-            s_qz[threadIdx.x] = __ldg(&in_qz[idx]);
-            s_m[threadIdx.x] = __ldg(&m[idx]);
+            s_qx[threadIdx.x] = in_qx[idx];
+            s_qy[threadIdx.x] = in_qy[idx];
+            s_qz[threadIdx.x] = in_qz[idx];
+            s_m[threadIdx.x] = m[idx];
         }
         __syncthreads();
 
@@ -148,13 +148,13 @@ __global__ void simulate_full_p1(int n, double* qx0, double* qy0, double* qz0,
     double* s_vz = s_vy + n;
 
     if (i < n) {
-        s_qx[i] = __ldg(&qx0[i]);
-        s_qy[i] = __ldg(&qy0[i]);
-        s_qz[i] = __ldg(&qz0[i]);
-        s_vx[i] = __ldg(&vx[i]);
-        s_vy[i] = __ldg(&vy[i]);
-        s_vz[i] = __ldg(&vz[i]);
-        s_m[i] = __ldg(&m[i]);
+        s_qx[i] = qx0[i];
+        s_qy[i] = qy0[i];
+        s_qz[i] = qz0[i];
+        s_vx[i] = vx[i];
+        s_vy[i] = vy[i];
+        s_vz[i] = vz[i];
+        s_m[i] = m[i];
     }
     __syncthreads();
 
@@ -242,15 +242,15 @@ __global__ void simulate_full_p2(int n, double* qx0, double* qy0, double* qz0,
     int* s_type = (int*)(s_m0 + n);
 
     if (i < n) {
-        s_qx[i] = __ldg(&qx0[i]);
-        s_qy[i] = __ldg(&qy0[i]);
-        s_qz[i] = __ldg(&qz0[i]);
-        s_vx[i] = __ldg(&vx[i]);
-        s_vy[i] = __ldg(&vy[i]);
-        s_vz[i] = __ldg(&vz[i]);
-        s_m[i] = __ldg(&m[i]);
-        s_m0[i] = __ldg(&m0[i]);
-        s_type[i] = __ldg(&type[i]);
+        s_qx[i] = qx0[i];
+        s_qy[i] = qy0[i];
+        s_qz[i] = qz0[i];
+        s_vx[i] = vx[i];
+        s_vy[i] = vy[i];
+        s_vz[i] = vz[i];
+        s_m[i] = m[i];
+        s_m0[i] = m0[i];
+        s_type[i] = type[i];
     }
     __syncthreads();
 
@@ -375,15 +375,15 @@ __global__ void simulate_full_p3(int n, double* qx0, double* qy0, double* qz0,
     int* s_type = (int*)(s_m0 + n);
 
     if (i < n) {
-        s_qx[i] = __ldg(&qx0[i]);
-        s_qy[i] = __ldg(&qy0[i]);
-        s_qz[i] = __ldg(&qz0[i]);
-        s_vx[i] = __ldg(&vx[i]);
-        s_vy[i] = __ldg(&vy[i]);
-        s_vz[i] = __ldg(&vz[i]);
-        s_m[i] = __ldg(&m[i]);
-        s_m0[i] = __ldg(&m0[i]);
-        s_type[i] = __ldg(&type[i]);
+        s_qx[i] = qx0[i];
+        s_qy[i] = qy0[i];
+        s_qz[i] = qz0[i];
+        s_vx[i] = vx[i];
+        s_vy[i] = vy[i];
+        s_vz[i] = vz[i];
+        s_m[i] = m[i];
+        s_m0[i] = m0[i];
+        s_type[i] = type[i];
     }
     __syncthreads();
 
