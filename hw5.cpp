@@ -39,7 +39,8 @@ __constant__ double d_missile_speed;
 __global__ void update_mass(int n, double* m, double* m0, int* type, double t) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n && type[i] == 2) {
-        m[i] = m0[i] + 0.5 * m0[i] * fabs(sin(t / 6000.0));
+        double tmp = __ldg(&m0[i]);
+        m[i] = tmp + 0.5 * tmp * fabs(sin(t / 6000.0));
     }
 }
 
@@ -49,9 +50,7 @@ __global__ void check_min_dist(int planet, int asteroid, double* qx, double* qy,
         double dy = qy[planet] - qy[asteroid];
         double dz = qz[planet] - qz[asteroid];
         double dist = sqrt(dx * dx + dy * dy + dz * dz);
-        if (dist < *min_dist) {
-            *min_dist = dist;
-        }
+        atomicMin(min_dist, dist);
     }
 }
 
@@ -62,7 +61,7 @@ __global__ void run_step(int n, double* in_qx, double* in_qy, double* in_qz,
                                         int planet, int asteroid, double* min_dist) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (min_dist != nullptr && i == 0 && t > d_dt) {
+    if (min_dist != nullptr) {
         double dx = in_qx[planet] - in_qx[asteroid];
         double dy = in_qy[planet] - in_qy[asteroid];
         double dz = in_qz[planet] - in_qz[asteroid];
@@ -71,7 +70,7 @@ __global__ void run_step(int n, double* in_qx, double* in_qy, double* in_qz,
     }
     
     double ax = 0.0, ay = 0.0, az = 0.0;
-    double cur_qx, cur_qy, cur_qz;
+    double cur_qx, cur_qy, cur_qz, cur_vx, cur_vy, cur_vz;
 
     if (i < n) {
         cur_qx = in_qx[i];
@@ -95,10 +94,10 @@ __global__ void run_step(int n, double* in_qx, double* in_qy, double* in_qz,
         __syncthreads();
 
         if (i < n) {
-            int limit = (tile + blockDim.x > n) ? (n - tile) : blockDim.x;
+            int limit = min(blockDim.x, n - tile);
             for (int j = 0; j < limit; j++) {
-                int global_j = tile + j;
-                if (i == global_j) continue;
+                int j_global = tile + j;
+                if (i == j_global) continue;
 
                 double mj = s_m[j];
                 
@@ -116,23 +115,26 @@ __global__ void run_step(int n, double* in_qx, double* in_qy, double* in_qz,
                 az += f * dz;
             }
         }
-        __syncthreads();
     }
 
     if (i < n) {
-        vx[i] += ax * d_dt;
-        vy[i] += ay * d_dt;
-        vz[i] += az * d_dt;
+        cur_vx = vx[i] + ax * d_dt;
+        cur_vy = vy[i] + ay * d_dt;
+        cur_vz = vz[i] + az * d_dt;
+        
+        vx[i] = cur_vx;
+        vy[i] = cur_vy;
+        vz[i] = cur_vz;
 
-        out_qx[i] = cur_qx + vx[i] * d_dt;
-        out_qy[i] = cur_qy + vy[i] * d_dt;
-        out_qz[i] = cur_qz + vz[i] * d_dt;
+        out_qx[i] = cur_qx + cur_vx * d_dt;
+        out_qy[i] = cur_qy + cur_vy * d_dt;
+        out_qz[i] = cur_qz + cur_vz * d_dt;
     }
 }
 
 __global__ void check_hits(int n, int planet, int asteroid, double* qx, double* qy, double* qz, int* type, int step, int* saved_step, int* hit_step) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    
+
     // Check planet-asteroid collision
     if (i == 0) {
         if (*hit_step == -1) {
