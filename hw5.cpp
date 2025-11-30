@@ -9,6 +9,9 @@
 #include <thread>
 #include <mutex>
 #include <hip/hip_runtime.h>
+#include <hip/hip_cooperative_groups.h>
+
+namespace cg = cooperative_groups;
 
 #define HIP_CHECK(cmd) \
 { \
@@ -61,7 +64,7 @@ __global__ void run_step(int n, double* in_qx, double* in_qy, double* in_qz,
                                         int planet, int asteroid, double* min_dist) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (min_dist != nullptr) {
+    if (i == 0 && min_dist != nullptr) {
         double dx = in_qx[planet] - in_qx[asteroid];
         double dy = in_qy[planet] - in_qy[asteroid];
         double dz = in_qz[planet] - in_qz[asteroid];
@@ -73,9 +76,9 @@ __global__ void run_step(int n, double* in_qx, double* in_qy, double* in_qz,
     double cur_qx, cur_qy, cur_qz, cur_vx, cur_vy, cur_vz;
 
     if (i < n) {
-        cur_qx = in_qx[i];
-        cur_qy = in_qy[i];
-        cur_qz = in_qz[i];
+        cur_qx = __ldg(&in_qx[i]);
+        cur_qy = __ldg(&in_qy[i]);
+        cur_qz = __ldg(&in_qz[i]);
     }
 
     __shared__ double s_qx[256];
@@ -86,19 +89,17 @@ __global__ void run_step(int n, double* in_qx, double* in_qy, double* in_qz,
     for (int tile = 0; tile < n; tile += blockDim.x) {
         int idx = tile + threadIdx.x;
         if (idx < n) {
-            s_qx[threadIdx.x] = in_qx[idx];
-            s_qy[threadIdx.x] = in_qy[idx];
-            s_qz[threadIdx.x] = in_qz[idx];
-            s_m[threadIdx.x] = m[idx];
+            s_qx[threadIdx.x] = __ldg(&in_qx[idx]);
+            s_qy[threadIdx.x] = __ldg(&in_qy[idx]);
+            s_qz[threadIdx.x] = __ldg(&in_qz[idx]);
+            s_m[threadIdx.x] = __ldg(&m[idx]);
         }
         __syncthreads();
 
         if (i < n) {
             int limit = min(blockDim.x, n - tile);
+            // #pragma unroll
             for (int j = 0; j < limit; j++) {
-                int j_global = tile + j;
-                if (i == j_global) continue;
-
                 double mj = s_m[j];
                 
                 double dx = s_qx[j] - cur_qx;
@@ -115,6 +116,7 @@ __global__ void run_step(int n, double* in_qx, double* in_qy, double* in_qz,
                 az += f * dz;
             }
         }
+        __syncthreads();
     }
 
     if (i < n) {
@@ -129,6 +131,729 @@ __global__ void run_step(int n, double* in_qx, double* in_qy, double* in_qz,
         out_qx[i] = cur_qx + cur_vx * d_dt;
         out_qy[i] = cur_qy + cur_vy * d_dt;
         out_qz[i] = cur_qz + cur_vz * d_dt;
+    }
+}
+
+__global__ void simulate_block_p1(int n, double* qx0, double* qy0, double* qz0, 
+                            double* qx1, double* qy1, double* qz1,
+                            double* vx, double* vy, double* vz,
+                            double* m, int planet, int asteroid, double* min_dist,
+                            int n_steps, double dt) {
+    int i = threadIdx.x;
+    
+    extern __shared__ double s_mem[];
+    double* s_qx = s_mem;
+    double* s_qy = s_qx + n;
+    double* s_qz = s_qy + n;
+    double* s_m = s_qz + n;
+    double* s_vx = s_m + n;
+    double* s_vy = s_vx + n;
+    double* s_vz = s_vy + n;
+
+    if (i < n) {
+        s_qx[i] = __ldg(&qx0[i]);
+        s_qy[i] = __ldg(&qy0[i]);
+        s_qz[i] = __ldg(&qz0[i]);
+        s_vx[i] = __ldg(&vx[i]);
+        s_vy[i] = __ldg(&vy[i]);
+        s_vz[i] = __ldg(&vz[i]);
+        s_m[i] = __ldg(&m[i]);
+    }
+    __syncthreads();
+
+    for (int step = 1; step <= n_steps; step++) {
+        if (i == 0) {
+             double dx = s_qx[planet] - s_qx[asteroid];
+             double dy = s_qy[planet] - s_qy[asteroid];
+             double dz = s_qz[planet] - s_qz[asteroid];
+             double dist = sqrt(dx * dx + dy * dy + dz * dz);
+             atomicMin(min_dist, dist);
+        }
+
+        double ax = 0.0, ay = 0.0, az = 0.0;
+        double cur_qx, cur_qy, cur_qz;
+
+        if (i < n) {
+            cur_qx = s_qx[i];
+            cur_qy = s_qy[i];
+            cur_qz = s_qz[i];
+        }
+
+        if (i < n) {
+            // #pragma unroll
+            for (int j = 0; j < n; j++) {
+                double mj = s_m[j];
+                double dx = s_qx[j] - cur_qx;
+                double dy = s_qy[j] - cur_qy;
+                double dz = s_qz[j] - cur_qz;
+                double dist2 = dx * dx + dy * dy + dz * dz + d_eps * d_eps;
+                double invDist = rsqrt(dist2);
+                double invDist3 = invDist * invDist * invDist;
+                double f = d_G * mj * invDist3;
+                ax += f * dx;
+                ay += f * dy;
+                az += f * dz;
+            }
+        }
+        
+        __syncthreads();
+
+        if (i < n) {
+            s_vx[i] += ax * dt;
+            s_vy[i] += ay * dt;
+            s_vz[i] += az * dt;
+            s_qx[i] += s_vx[i] * dt;
+            s_qy[i] += s_vy[i] * dt;
+            s_qz[i] += s_vz[i] * dt;
+        }
+        __syncthreads();
+    }
+    
+    if (i == 0) {
+        double dx = s_qx[planet] - s_qx[asteroid];
+        double dy = s_qy[planet] - s_qy[asteroid];
+        double dz = s_qz[planet] - s_qz[asteroid];
+        double dist = sqrt(dx * dx + dy * dy + dz * dz);
+        atomicMin(min_dist, dist);
+    }
+}
+
+__global__ void simulate_grid_p1(int n, double* qx0, double* qy0, double* qz0,
+                                        double* qx1, double* qy1, double* qz1,
+                                        double* vx, double* vy, double* vz,
+                                        double* m, 
+                                        int planet, int asteroid, double* min_dist,
+                                        int n_steps, double dt) {
+    auto grid = cg::this_grid();
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    double* in_qx = qx0;
+    double* in_qy = qy0;
+    double* in_qz = qz0;
+    double* out_qx = qx1;
+    double* out_qy = qy1;
+    double* out_qz = qz1;
+
+    for (int step = 1; step <= n_steps; step++) {
+        if (i == 0) {
+             double dx = in_qx[planet] - in_qx[asteroid];
+             double dy = in_qy[planet] - in_qy[asteroid];
+             double dz = in_qz[planet] - in_qz[asteroid];
+             double dist = sqrt(dx * dx + dy * dy + dz * dz);
+             atomicMin(min_dist, dist);
+        }
+
+        double ax = 0.0, ay = 0.0, az = 0.0;
+        double cur_qx, cur_qy, cur_qz;
+        double cur_vx, cur_vy, cur_vz;
+
+        if (i < n) {
+            cur_qx = in_qx[i];
+            cur_qy = in_qy[i];
+            cur_qz = in_qz[i];
+            cur_vx = vx[i];
+            cur_vy = vy[i];
+            cur_vz = vz[i];
+        }
+
+        __shared__ double s_qx[256];
+        __shared__ double s_qy[256];
+        __shared__ double s_qz[256];
+        __shared__ double s_m[256];
+
+        for (int tile = 0; tile < n; tile += blockDim.x) {
+            int idx = tile + threadIdx.x;
+            if (idx < n) {
+                s_qx[threadIdx.x] = in_qx[idx];
+                s_qy[threadIdx.x] = in_qy[idx];
+                s_qz[threadIdx.x] = in_qz[idx];
+                s_m[threadIdx.x] = m[idx];
+            }
+            __syncthreads();
+
+            if (i < n) {
+                int limit = min(blockDim.x, n - tile);
+                for (int j = 0; j < limit; j++) {
+                    int j_global = tile + j;
+                    if (i == j_global) continue;
+
+                    double mj = s_m[j];
+                    double dx = s_qx[j] - cur_qx;
+                    double dy = s_qy[j] - cur_qy;
+                    double dz = s_qz[j] - cur_qz;
+                    double dist2 = dx * dx + dy * dy + dz * dz + d_eps * d_eps;
+                    double invDist = rsqrt(dist2);
+                    double invDist3 = invDist * invDist * invDist;
+                    double f = d_G * mj * invDist3;
+
+                    ax += f * dx;
+                    ay += f * dy;
+                    az += f * dz;
+                }
+            }
+            __syncthreads();
+        }
+
+        if (i < n) {
+            cur_vx += ax * dt;
+            cur_vy += ay * dt;
+            cur_vz += az * dt;
+            
+            vx[i] = cur_vx;
+            vy[i] = cur_vy;
+            vz[i] = cur_vz;
+
+            out_qx[i] = cur_qx + cur_vx * dt;
+            out_qy[i] = cur_qy + cur_vy * dt;
+            out_qz[i] = cur_qz + cur_vz * dt;
+        }
+
+        grid.sync();
+
+        double* tmp;
+        tmp = in_qx; in_qx = out_qx; out_qx = tmp;
+        tmp = in_qy; in_qy = out_qy; out_qy = tmp;
+        tmp = in_qz; in_qz = out_qz; out_qz = tmp;
+    }
+    
+    if (i == 0) {
+        double dx = in_qx[planet] - in_qx[asteroid];
+        double dy = in_qy[planet] - in_qy[asteroid];
+        double dz = in_qz[planet] - in_qz[asteroid];
+        double dist = sqrt(dx * dx + dy * dy + dz * dz);
+        atomicMin(min_dist, dist);
+    }
+}
+
+__global__ void simulate_block_p2(int n, double* qx0, double* qy0, double* qz0, 
+                            double* qx1, double* qy1, double* qz1,
+                            double* vx, double* vy, double* vz,
+                            double* m, double* m0, int* type,
+                            int planet, int asteroid,
+                            int* hit_step, int* saved_step,
+                            double* s_qx_out, double* s_qy_out, double* s_qz_out,
+                            double* s_vx_out, double* s_vy_out, double* s_vz_out,
+                            double* s_m_out, int* s_type_out,
+                            int n_steps, double dt) {
+    int i = threadIdx.x;
+    
+    extern __shared__ double s_mem[];
+    double* s_qx = s_mem;
+    double* s_qy = s_qx + n;
+    double* s_qz = s_qy + n;
+    double* s_m = s_qz + n;
+    double* s_vx = s_m + n;
+    double* s_vy = s_vx + n;
+    double* s_vz = s_vy + n;
+    double* s_m0 = s_vz + n;
+    int* s_type = (int*)(s_m0 + n);
+
+    if (i < n) {
+        s_qx[i] = __ldg(&qx0[i]);
+        s_qy[i] = __ldg(&qy0[i]);
+        s_qz[i] = __ldg(&qz0[i]);
+        s_vx[i] = __ldg(&vx[i]);
+        s_vy[i] = __ldg(&vy[i]);
+        s_vz[i] = __ldg(&vz[i]);
+        s_m[i] = __ldg(&m[i]);
+        s_m0[i] = __ldg(&m0[i]);
+        s_type[i] = __ldg(&type[i]);
+    }
+    __syncthreads();
+
+    for (int step = 1; step <= n_steps; step++) {
+        double t = step * dt;
+        
+        // Update mass
+        if (i < n && s_type[i] == 2) {
+            double tmp = s_m0[i];
+            s_m[i] = tmp + 0.5 * tmp * fabs(sin(t / 6000.0));
+        }
+        __syncthreads();
+
+        // N-body
+        double ax = 0.0, ay = 0.0, az = 0.0;
+        double cur_qx, cur_qy, cur_qz;
+
+        if (i < n) {
+            cur_qx = s_qx[i];
+            cur_qy = s_qy[i];
+            cur_qz = s_qz[i];
+        }
+
+        if (i < n) {
+            // #pragma unroll
+            for (int j = 0; j < n; j++) {
+                double mj = s_m[j];
+                double dx = s_qx[j] - cur_qx;
+                double dy = s_qy[j] - cur_qy;
+                double dz = s_qz[j] - cur_qz;
+                double dist2 = dx * dx + dy * dy + dz * dz + d_eps * d_eps;
+                double invDist = rsqrt(dist2);
+                double invDist3 = invDist * invDist * invDist;
+                double f = d_G * mj * invDist3;
+                ax += f * dx;
+                ay += f * dy;
+                az += f * dz;
+            }
+        }
+        __syncthreads();
+
+        if (i < n) {
+            s_vx[i] += ax * dt;
+            s_vy[i] += ay * dt;
+            s_vz[i] += az * dt;
+            s_qx[i] += s_vx[i] * dt;
+            s_qy[i] += s_vy[i] * dt;
+            s_qz[i] += s_vz[i] * dt;
+        }
+        __syncthreads();
+
+        // Check hits
+        if (i == 0) {
+             if (*hit_step == -1) {
+                double dx = s_qx[planet] - s_qx[asteroid];
+                double dy = s_qy[planet] - s_qy[asteroid];
+                double dz = s_qz[planet] - s_qz[asteroid];
+                if (dx * dx + dy * dy + dz * dz < d_planet_radius * d_planet_radius) {
+                    *hit_step = step;
+                }
+            }
+        }
+        
+        // Check missile hits
+        if (i < n && s_type[i] == 2) {
+            if (*saved_step == -1) {
+                double dx = s_qx[planet] - s_qx[i];
+                double dy = s_qy[planet] - s_qy[i];
+                double dz = s_qz[planet] - s_qz[i];
+                double dist = sqrt(dx * dx + dy * dy + dz * dz);
+                
+                double missile_dist = step * dt * d_missile_speed;
+                if (missile_dist > dist) {
+                    atomicCAS(saved_step, -1, step);
+                }
+            }
+        }
+        __syncthreads();
+
+        // Save state
+        if (*saved_step == step) {
+             if (i < n) {
+                s_qx_out[i] = s_qx[i];
+                s_qy_out[i] = s_qy[i];
+                s_qz_out[i] = s_qz[i];
+                s_vx_out[i] = s_vx[i];
+                s_vy_out[i] = s_vy[i];
+                s_vz_out[i] = s_vz[i];
+                s_m_out[i] = s_m[i];
+                s_type_out[i] = s_type[i];
+             }
+        }
+        __syncthreads();
+        
+        if (step % 2000 == 0) {
+             if (*hit_step != -1) break;
+        }
+    }
+}
+
+__global__ void simulate_grid_p2(int n, double* qx0, double* qy0, double* qz0,
+                                        double* qx1, double* qy1, double* qz1,
+                                        double* vx, double* vy, double* vz,
+                                        double* m, double* m0, int* type,
+                                        int planet, int asteroid,
+                                        int* hit_step, int* saved_step,
+                                        double* s_qx_out, double* s_qy_out, double* s_qz_out,
+                                        double* s_vx_out, double* s_vy_out, double* s_vz_out,
+                                        double* s_m_out, int* s_type_out,
+                                        int n_steps, double dt) {
+    auto grid = cg::this_grid();
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    double* in_qx = qx0;
+    double* in_qy = qy0;
+    double* in_qz = qz0;
+    double* out_qx = qx1;
+    double* out_qy = qy1;
+    double* out_qz = qz1;
+    
+    __shared__ double s_qx[256];
+    __shared__ double s_qy[256];
+    __shared__ double s_qz[256];
+    __shared__ double s_m[256];
+
+    for (int step = 1; step <= n_steps; step++) {
+        double t = step * dt;
+
+        // Update mass
+        if (i < n && type[i] == 2) {
+            double tmp = m0[i];
+            m[i] = tmp + 0.5 * tmp * fabs(sin(t / 6000.0));
+        }
+        grid.sync();
+
+        // N-body step
+        double ax = 0.0, ay = 0.0, az = 0.0;
+        double cur_qx, cur_qy, cur_qz;
+        double cur_vx, cur_vy, cur_vz;
+
+        if (i < n) {
+            cur_qx = in_qx[i];
+            cur_qy = in_qy[i];
+            cur_qz = in_qz[i];
+            cur_vx = vx[i];
+            cur_vy = vy[i];
+            cur_vz = vz[i];
+        }
+
+        for (int tile = 0; tile < n; tile += blockDim.x) {
+            int idx = tile + threadIdx.x;
+            if (idx < n) {
+                s_qx[threadIdx.x] = in_qx[idx];
+                s_qy[threadIdx.x] = in_qy[idx];
+                s_qz[threadIdx.x] = in_qz[idx];
+                s_m[threadIdx.x] = m[idx];
+            }
+            __syncthreads();
+
+            if (i < n) {
+                int limit = min(blockDim.x, n - tile);
+                for (int j = 0; j < limit; j++) {
+                    int j_global = tile + j;
+                    if (i == j_global) continue;
+
+                    double mj = s_m[j];
+                    double dx = s_qx[j] - cur_qx;
+                    double dy = s_qy[j] - cur_qy;
+                    double dz = s_qz[j] - cur_qz;
+                    double dist2 = dx * dx + dy * dy + dz * dz + d_eps * d_eps;
+                    double invDist = rsqrt(dist2);
+                    double invDist3 = invDist * invDist * invDist;
+                    double f = d_G * mj * invDist3;
+
+                    ax += f * dx;
+                    ay += f * dy;
+                    az += f * dz;
+                }
+            }
+            __syncthreads();
+        }
+
+        if (i < n) {
+            cur_vx += ax * dt;
+            cur_vy += ay * dt;
+            cur_vz += az * dt;
+            
+            vx[i] = cur_vx;
+            vy[i] = cur_vy;
+            vz[i] = cur_vz;
+
+            out_qx[i] = cur_qx + cur_vx * dt;
+            out_qy[i] = cur_qy + cur_vy * dt;
+            out_qz[i] = cur_qz + cur_vz * dt;
+        }
+        grid.sync();
+
+        // Check hits
+        if (i == 0) {
+             if (*hit_step == -1) {
+                double dx = out_qx[planet] - out_qx[asteroid];
+                double dy = out_qy[planet] - out_qy[asteroid];
+                double dz = out_qz[planet] - out_qz[asteroid];
+                if (dx * dx + dy * dy + dz * dz < d_planet_radius * d_planet_radius) {
+                    *hit_step = step;
+                }
+            }
+        }
+        
+        // Check missile hits
+        if (i < n && type[i] == 2) {
+            if (*saved_step == -1) {
+                double dx = out_qx[planet] - out_qx[i];
+                double dy = out_qy[planet] - out_qy[i];
+                double dz = out_qz[planet] - out_qz[i];
+                double dist = sqrt(dx * dx + dy * dy + dz * dz);
+                
+                double missile_dist = step * dt * d_missile_speed;
+                if (missile_dist > dist) {
+                    atomicCAS(saved_step, -1, step);
+                }
+            }
+        }
+        grid.sync();
+
+        // Save state
+        if (*saved_step == step) {
+             if (i < n) {
+                s_qx_out[i] = out_qx[i];
+                s_qy_out[i] = out_qy[i];
+                s_qz_out[i] = out_qz[i];
+                s_vx_out[i] = vx[i];
+                s_vy_out[i] = vy[i];
+                s_vz_out[i] = vz[i];
+                s_m_out[i] = m[i];
+                s_type_out[i] = type[i];
+             }
+        }
+        grid.sync();
+
+        // Swap
+        double* tmp;
+        tmp = in_qx; in_qx = out_qx; out_qx = tmp;
+        tmp = in_qy; in_qy = out_qy; out_qy = tmp;
+        tmp = in_qz; in_qz = out_qz; out_qz = tmp;
+        
+        if (step % 2000 == 0) {
+             if (*hit_step != -1) break;
+        }
+    }
+}
+
+__global__ void simulate_block_p3(int n, double* qx0, double* qy0, double* qz0, 
+                            double* qx1, double* qy1, double* qz1,
+                            double* vx, double* vy, double* vz,
+                            double* m, double* m0, int* type,
+                            int planet, int asteroid, int target_device,
+                            int* hit_step, int* destroyed_step,
+                            int start_step, int n_steps, double dt) {
+    int i = threadIdx.x;
+    
+    extern __shared__ double s_mem[];
+    double* s_qx = s_mem;
+    double* s_qy = s_qx + n;
+    double* s_qz = s_qy + n;
+    double* s_m = s_qz + n;
+    double* s_vx = s_m + n;
+    double* s_vy = s_vx + n;
+    double* s_vz = s_vy + n;
+    double* s_m0 = s_vz + n;
+    int* s_type = (int*)(s_m0 + n);
+
+    if (i < n) {
+        s_qx[i] = __ldg(&qx0[i]);
+        s_qy[i] = __ldg(&qy0[i]);
+        s_qz[i] = __ldg(&qz0[i]);
+        s_vx[i] = __ldg(&vx[i]);
+        s_vy[i] = __ldg(&vy[i]);
+        s_vz[i] = __ldg(&vz[i]);
+        s_m[i] = __ldg(&m[i]);
+        s_m0[i] = __ldg(&m0[i]);
+        s_type[i] = __ldg(&type[i]);
+    }
+    __syncthreads();
+
+    for (int step = start_step + 1; step <= n_steps; step++) {
+        double t = step * dt;
+        
+        // Update mass
+        if (i < n && s_type[i] == 2) {
+            double tmp = s_m0[i];
+            s_m[i] = tmp + 0.5 * tmp * fabs(sin(t / 6000.0));
+        }
+        __syncthreads();
+
+        // N-body
+        double ax = 0.0, ay = 0.0, az = 0.0;
+        double cur_qx, cur_qy, cur_qz;
+
+        if (i < n) {
+            cur_qx = s_qx[i];
+            cur_qy = s_qy[i];
+            cur_qz = s_qz[i];
+        }
+
+        if (i < n) {
+            // #pragma unroll
+            for (int j = 0; j < n; j++) {
+                double mj = s_m[j];
+                double dx = s_qx[j] - cur_qx;
+                double dy = s_qy[j] - cur_qy;
+                double dz = s_qz[j] - cur_qz;
+                double dist2 = dx * dx + dy * dy + dz * dz + d_eps * d_eps;
+                double invDist = rsqrt(dist2);
+                double invDist3 = invDist * invDist * invDist;
+                double f = d_G * mj * invDist3;
+                ax += f * dx;
+                ay += f * dy;
+                az += f * dz;
+            }
+        }
+        __syncthreads();
+
+        if (i < n) {
+            s_vx[i] += ax * dt;
+            s_vy[i] += ay * dt;
+            s_vz[i] += az * dt;
+            s_qx[i] += s_vx[i] * dt;
+            s_qy[i] += s_vy[i] * dt;
+            s_qz[i] += s_vz[i] * dt;
+        }
+        __syncthreads();
+
+        // Check hit and destroy
+        if (i == 0) {
+            if (*hit_step == -1) {
+                double dx = s_qx[planet] - s_qx[asteroid];
+                double dy = s_qy[planet] - s_qy[asteroid];
+                double dz = s_qz[planet] - s_qz[asteroid];
+                if (dx * dx + dy * dy + dz * dz < d_planet_radius * d_planet_radius) {
+                    *hit_step = step;
+                }
+            }
+
+            if (*destroyed_step == -1) {
+                double dx = s_qx[planet] - s_qx[target_device];
+                double dy = s_qy[planet] - s_qy[target_device];
+                double dz = s_qz[planet] - s_qz[target_device];
+                double dist = sqrt(dx * dx + dy * dy + dz * dz);
+                
+                double missile_dist = step * dt * d_missile_speed;
+                if (missile_dist > dist) {
+                    *destroyed_step = step;
+                    s_type[target_device] = 3; // destroyed
+                    s_m[target_device] = 0.0;
+                }
+            }
+        }
+        __syncthreads();
+
+        if (step % 2000 == 0) {
+             if (*hit_step != -1) break;
+        }
+    }
+}
+
+__global__ void simulate_grid_p3(int n, double* qx0, double* qy0, double* qz0,
+                                        double* qx1, double* qy1, double* qz1,
+                                        double* vx, double* vy, double* vz,
+                                        double* m, double* m0, int* type,
+                                        int planet, int asteroid, int target_device,
+                                        int* hit_step, int* destroyed_step,
+                                        int start_step, int n_steps, double dt) {
+    auto grid = cg::this_grid();
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    double* in_qx = qx0;
+    double* in_qy = qy0;
+    double* in_qz = qz0;
+    double* out_qx = qx1;
+    double* out_qy = qy1;
+    double* out_qz = qz1;
+    
+    __shared__ double s_qx[256];
+    __shared__ double s_qy[256];
+    __shared__ double s_qz[256];
+    __shared__ double s_m[256];
+
+    for (int step = start_step + 1; step <= n_steps; step++) {
+        double t = step * dt;
+
+        // Update mass
+        if (i < n && type[i] == 2) {
+            double tmp = m0[i];
+            m[i] = tmp + 0.5 * tmp * fabs(sin(t / 6000.0));
+        }
+        grid.sync();
+
+        // N-body step
+        double ax = 0.0, ay = 0.0, az = 0.0;
+        double cur_qx, cur_qy, cur_qz;
+        double cur_vx, cur_vy, cur_vz;
+
+        if (i < n) {
+            cur_qx = in_qx[i];
+            cur_qy = in_qy[i];
+            cur_qz = in_qz[i];
+            cur_vx = vx[i];
+            cur_vy = vy[i];
+            cur_vz = vz[i];
+        }
+
+        for (int tile = 0; tile < n; tile += blockDim.x) {
+            int idx = tile + threadIdx.x;
+            if (idx < n) {
+                s_qx[threadIdx.x] = in_qx[idx];
+                s_qy[threadIdx.x] = in_qy[idx];
+                s_qz[threadIdx.x] = in_qz[idx];
+                s_m[threadIdx.x] = m[idx];
+            }
+            __syncthreads();
+
+            if (i < n) {
+                int limit = min(blockDim.x, n - tile);
+                for (int j = 0; j < limit; j++) {
+                    int j_global = tile + j;
+                    if (i == j_global) continue;
+
+                    double mj = s_m[j];
+                    double dx = s_qx[j] - cur_qx;
+                    double dy = s_qy[j] - cur_qy;
+                    double dz = s_qz[j] - cur_qz;
+                    double dist2 = dx * dx + dy * dy + dz * dz + d_eps * d_eps;
+                    double invDist = rsqrt(dist2);
+                    double invDist3 = invDist * invDist * invDist;
+                    double f = d_G * mj * invDist3;
+
+                    ax += f * dx;
+                    ay += f * dy;
+                    az += f * dz;
+                }
+            }
+            __syncthreads();
+        }
+
+        if (i < n) {
+            cur_vx += ax * dt;
+            cur_vy += ay * dt;
+            cur_vz += az * dt;
+            
+            vx[i] = cur_vx;
+            vy[i] = cur_vy;
+            vz[i] = cur_vz;
+
+            out_qx[i] = cur_qx + cur_vx * dt;
+            out_qy[i] = cur_qy + cur_vy * dt;
+            out_qz[i] = cur_qz + cur_vz * dt;
+        }
+        grid.sync();
+
+        // Check hit and destroy
+        if (i == 0) {
+            if (*hit_step == -1) {
+                double dx = out_qx[planet] - out_qx[asteroid];
+                double dy = out_qy[planet] - out_qy[asteroid];
+                double dz = out_qz[planet] - out_qz[asteroid];
+                if (dx * dx + dy * dy + dz * dz < d_planet_radius * d_planet_radius) {
+                    *hit_step = step;
+                }
+            }
+
+            if (*destroyed_step == -1) {
+                double dx = out_qx[planet] - out_qx[target_device];
+                double dy = out_qy[planet] - out_qy[target_device];
+                double dz = out_qz[planet] - out_qz[target_device];
+                double dist = sqrt(dx * dx + dy * dy + dz * dz);
+                
+                double missile_dist = step * dt * d_missile_speed;
+                if (missile_dist > dist) {
+                    *destroyed_step = step;
+                    type[target_device] = 3; // destroyed
+                    m[target_device] = 0.0;
+                }
+            }
+        }
+        grid.sync();
+
+        // Swap
+        double* tmp;
+        tmp = in_qx; in_qx = out_qx; out_qx = tmp;
+        tmp = in_qy; in_qy = out_qy; out_qy = tmp;
+        tmp = in_qz; in_qz = out_qz; out_qz = tmp;
+        
+        if (step % 2000 == 0) {
+             if (*hit_step != -1) break;
+        }
     }
 }
 
@@ -330,19 +1055,28 @@ int main(int argc, char** argv) {
         int blockSize = 256;
         int numBlocks = (ctx.n + blockSize - 1) / blockSize;
         
-        int in = 0;
-        int out = 1;
-
-        for (int step = 0; step <= param::n_steps; step++) {
-            if (step > 0) {
+        int n_steps = param::n_steps;
+        double dt = param::dt;
+        
+        if (ctx.n < 200) {
+            size_t shared_mem_size = ctx.n * 7 * sizeof(double);
+            simulate_block_p1<<<1, ctx.n, shared_mem_size>>>(ctx.n, d_qx[0], d_qy[0], d_qz[0], 
+                            d_qx[1], d_qy[1], d_qz[1],
+                            d_vx, d_vy, d_vz,
+                            d_m, ctx.planet, ctx.asteroid, d_min_dist,
+                            n_steps, dt);
+        } else {
+            int in = 0;
+            int out = 1;
+            for (int step = 1; step <= n_steps; step++) {
                 run_step<<<numBlocks, blockSize>>>(ctx.n, 
                     d_qx[in], d_qy[in], d_qz[in], d_vx, d_vy, d_vz,
                     d_qx[out], d_qy[out], d_qz[out],
-                    d_m, step * param::dt, ctx.planet, ctx.asteroid, d_min_dist);
+                    d_m, step * dt, ctx.planet, ctx.asteroid, d_min_dist);
                 std::swap(in, out);
             }
+            check_min_dist<<<1, 1>>>(ctx.planet, ctx.asteroid, d_qx[in], d_qy[in], d_qz[in], d_min_dist);
         }
-        check_min_dist<<<1, 1>>>(ctx.planet, ctx.asteroid, d_qx[in], d_qy[in], d_qz[in], d_min_dist);
         
         HIP_CHECK(hipMemcpy(&min_dist, d_min_dist, sizeof(double), hipMemcpyDeviceToHost));
         for(int k = 0; k < 2; k++) {
@@ -408,23 +1142,42 @@ int main(int argc, char** argv) {
         int in = 0;
         int out = 1;
 
-        for (int step = 0; step <= param::n_steps; step++) {
-            if (step > 0) {
+        // Step 0
+        check_hits<<<numBlocks, blockSize>>>(ctx.n, ctx.planet, ctx.asteroid, d_qx[in], d_qy[in], d_qz[in], d_type, 0, d_saved_step, d_hit_step);
+        save_state<<<numBlocks, blockSize>>>(ctx.n, d_qx[in], d_qy[in], d_qz[in], d_vx, d_vy, d_vz, d_m, d_type, 0, d_saved_step,
+            d_saved_qx, d_saved_qy, d_saved_qz, d_saved_vx, d_saved_vy, d_saved_vz, d_saved_m, d_saved_type);
+
+        if (ctx.n < 200) {
+            size_t shared_mem_size = ctx.n * (8 * sizeof(double) + sizeof(int));
+            simulate_block_p2<<<1, ctx.n, shared_mem_size>>>(ctx.n, d_qx[in], d_qy[in], d_qz[in], 
+                            d_qx[out], d_qy[out], d_qz[out],
+                            d_vx, d_vy, d_vz,
+                            d_m, d_m0, d_type,
+                            ctx.planet, ctx.asteroid,
+                            d_hit_step, d_saved_step,
+                            d_saved_qx, d_saved_qy, d_saved_qz, d_saved_vx, d_saved_vy, d_saved_vz, d_saved_m, d_saved_type,
+                            param::n_steps, param::dt);
+        } else {
+            for (int step = 1; step <= param::n_steps; step++) {
                 update_mass<<<numBlocks, blockSize>>>(ctx.n, d_m, d_m0, d_type, step * param::dt);
+                
                 run_step<<<numBlocks, blockSize>>>(ctx.n, 
                     d_qx[in], d_qy[in], d_qz[in], d_vx, d_vy, d_vz,
                     d_qx[out], d_qy[out], d_qz[out],
-                    d_m, step * param::dt, 0, 0, nullptr);
+                    d_m, step * param::dt, ctx.planet, ctx.asteroid, nullptr);
+                
+                check_hits<<<numBlocks, blockSize>>>(ctx.n, ctx.planet, ctx.asteroid, d_qx[out], d_qy[out], d_qz[out], d_type, step, d_saved_step, d_hit_step);
+                
+                save_state<<<numBlocks, blockSize>>>(ctx.n, d_qx[out], d_qy[out], d_qz[out], d_vx, d_vy, d_vz, d_m, d_type, step, d_saved_step,
+                    d_saved_qx, d_saved_qy, d_saved_qz, d_saved_vx, d_saved_vy, d_saved_vz, d_saved_m, d_saved_type);
+                
                 std::swap(in, out);
-            }
-            check_hits<<<numBlocks, blockSize>>>(ctx.n, ctx.planet, ctx.asteroid, d_qx[in], d_qy[in], d_qz[in], d_type, step, d_saved_step, d_hit_step);
-            save_state<<<numBlocks, blockSize>>>(ctx.n, d_qx[in], d_qy[in], d_qz[in], d_vx, d_vy, d_vz, d_m, d_type, step, d_saved_step,
-                d_saved_qx, d_saved_qy, d_saved_qz, d_saved_vx, d_saved_vy, d_saved_vz, d_saved_m, d_saved_type);
-                    
-            if (step % 2000 == 0) {
-                int h_hit;
-                HIP_CHECK(hipMemcpy(&h_hit, d_hit_step, sizeof(int), hipMemcpyDeviceToHost));
-                if (h_hit != -1) break;
+                
+                if (step % 2000 == 0) {
+                    int h_hit_step;
+                    HIP_CHECK(hipMemcpy(&h_hit_step, d_hit_step, sizeof(int), hipMemcpyDeviceToHost));
+                    if (h_hit_step != -1) break;
+                }
             }
         }
         
@@ -534,21 +1287,37 @@ int main(int argc, char** argv) {
             int in = 0;
             int out = 1;
 
-            for (int step = start_step; step <= param::n_steps; step++) {
-                if (step > start_step) {
+            // Step start_step
+            check_hit_and_destroy<<<1, 1>>>(ctx.planet, ctx.asteroid, d_idx, d_qx[in], d_qy[in], d_qz[in], d_m, d_type, start_step, d_hit_step, d_destroyed_step);
+
+        
+            if (ctx.n < 200) {
+                size_t shared_mem_size = ctx.n * (8 * sizeof(double) + sizeof(int));
+                simulate_block_p3<<<1, ctx.n, shared_mem_size>>>(ctx.n, d_qx[in], d_qy[in], d_qz[in], 
+                                d_qx[out], d_qy[out], d_qz[out],
+                                d_vx, d_vy, d_vz,
+                                d_m, d_m0, d_type,
+                                ctx.planet, ctx.asteroid, d_idx,
+                                d_hit_step, d_destroyed_step,
+                                start_step, param::n_steps, param::dt);
+            } else {
+                for (int step = start_step + 1; step <= param::n_steps; step++) {
                     update_mass<<<numBlocks, blockSize>>>(ctx.n, d_m, d_m0, d_type, step * param::dt);
+                    
                     run_step<<<numBlocks, blockSize>>>(ctx.n, 
                         d_qx[in], d_qy[in], d_qz[in], d_vx, d_vy, d_vz,
                         d_qx[out], d_qy[out], d_qz[out],
-                        d_m, step * param::dt, 0, 0, nullptr);
+                        d_m, step * param::dt, ctx.planet, ctx.asteroid, nullptr);
+                    
+                    check_hit_and_destroy<<<1, 1>>>(ctx.planet, ctx.asteroid, d_idx, d_qx[out], d_qy[out], d_qz[out], d_m, d_type, step, d_hit_step, d_destroyed_step);
+                    
                     std::swap(in, out);
-                }
-                check_hit_and_destroy<<<1, 1>>>(ctx.planet, ctx.asteroid, d_idx, d_qx[in], d_qy[in], d_qz[in], d_m, d_type, step, d_hit_step, d_destroyed_step);
-                                
-                if (step % 2000 == 0) {
-                    int h_hit;
-                    HIP_CHECK(hipMemcpy(&h_hit, d_hit_step, sizeof(int), hipMemcpyDeviceToHost));
-                    if (h_hit != -1) break;
+                    
+                    if (step % 2000 == 0) {
+                        int h_hit_step;
+                        HIP_CHECK(hipMemcpy(&h_hit_step, d_hit_step, sizeof(int), hipMemcpyDeviceToHost));
+                        if (h_hit_step != -1) break;
+                    }
                 }
             }
             
