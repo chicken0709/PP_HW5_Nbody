@@ -672,7 +672,7 @@ int main(int argc, char** argv) {
         int n_steps = param::n_steps;
         double dt = param::dt;
         
-        if (ctx.n < 200) {
+        if (ctx.n <= 256) {
             size_t shared_mem_size = ctx.n * 7 * sizeof(double);
             simulate_full_p1<<<1, ctx.n, shared_mem_size>>>(ctx.n, d_qx[0], d_qy[0], d_qz[0], 
                             d_qx[1], d_qy[1], d_qz[1],
@@ -761,7 +761,7 @@ int main(int argc, char** argv) {
         save_state<<<numBlocks, blockSize>>>(ctx.n, d_qx[in], d_qy[in], d_qz[in], d_vx, d_vy, d_vz, d_m, d_type, 0, d_saved_step,
             d_saved_qx, d_saved_qy, d_saved_qz, d_saved_vx, d_saved_vy, d_saved_vz, d_saved_m, d_saved_type);
 
-        if (ctx.n < 200) {
+        if (ctx.n <= 256) {
             size_t shared_mem_size = ctx.n * (8 * sizeof(double) + sizeof(int));
             simulate_full_p2<<<1, ctx.n, shared_mem_size>>>(ctx.n, d_qx[in], d_qy[in], d_qz[in], 
                             d_qx[out], d_qy[out], d_qz[out],
@@ -905,7 +905,7 @@ int main(int argc, char** argv) {
             check_hit_and_destroy<<<1, 1>>>(ctx.planet, ctx.asteroid, d_idx, d_qx[in], d_qy[in], d_qz[in], d_m, d_type, start_step, d_hit_step, d_destroyed_step);
 
         
-            if (ctx.n < 200) {
+            if (ctx.n <= 256) {
                 size_t shared_mem_size = ctx.n * (8 * sizeof(double) + sizeof(int));
                 simulate_full_p3<<<1, ctx.n, shared_mem_size>>>(ctx.n, d_qx[in], d_qy[in], d_qz[in], 
                                 d_qx[out], d_qy[out], d_qz[out],
