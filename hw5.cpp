@@ -69,9 +69,13 @@ __global__ void compute_forces_and_integrate(int n, const double* in_qx, const d
     int i = blockIdx.x;
     int j = threadIdx.x;
 
-    double dx = in_qx[j] - in_qx[i];
-    double dy = in_qy[j] - in_qy[i];
-    double dz = in_qz[j] - in_qz[i];
+    double in_qx_i = in_qx[i];
+    double in_qy_i = in_qy[i];
+    double in_qz_i = in_qz[i];
+
+    double dx = in_qx[j] - in_qx_i;
+    double dy = in_qy[j] - in_qy_i;
+    double dz = in_qz[j] - in_qz_i;
     double dist2 = dx * dx + dy * dy + dz * dz + d_eps * d_eps;
     double invDist = rsqrt(dist2);
     double invDist3 = invDist * invDist * invDist;
@@ -119,9 +123,9 @@ __global__ void compute_forces_and_integrate(int n, const double* in_qx, const d
             vy[i] = new_vy;
             vz[i] = new_vz;
             
-            out_qx[i] = in_qx[i] + new_vx * d_dt;
-            out_qy[i] = in_qy[i] + new_vy * d_dt;
-            out_qz[i] = in_qz[i] + new_vz * d_dt;
+            out_qx[i] = in_qx_i + new_vx * d_dt;
+            out_qy[i] = in_qy_i + new_vy * d_dt;
+            out_qz[i] = in_qz_i + new_vz * d_dt;
             
             if (i == 0 && min_dist != nullptr) {
                 double pdx = in_qx[planet] - in_qx[asteroid];
