@@ -31,8 +31,6 @@ namespace param {
     inline double get_missile_cost(double t) { return 1e5 + 1e3 * t; }
 }
 
-constexpr int kForceBlockDim = 16;
-
 // Device constants
 __constant__ double d_dt;
 __constant__ double d_eps;
@@ -85,9 +83,9 @@ __global__ void compute_forces_and_integrate(int n, const double* in_qx, const d
 
     __syncthreads();
 
+    // Shared memory reduction until we have 64 or fewer elements
     unsigned int len = blockDim.x;
-    while (len > 1) {
-        __syncthreads();
+    while (len > 64) {
         unsigned int stride = (len + 1) / 2;
         if (j < len / 2) {
             sx[j] += sx[j + stride];
@@ -95,29 +93,43 @@ __global__ void compute_forces_and_integrate(int n, const double* in_qx, const d
             sz[j] += sz[j + stride];
         }
         len = stride;
+        __syncthreads();
     }
 
-    __syncthreads();
-
-    if (j == 0) {
-        double new_vx = vx[i] + sx[0] * d_dt;
-        double new_vy = vy[i] + sy[0] * d_dt;
-        double new_vz = vz[i] + sz[0] * d_dt;
+    // Warp-level reduction for last 64 elements (warp size on AMD)
+    if (j < 64) {
+        double val_x = sx[j];
+        double val_y = sy[j];
+        double val_z = sz[j];
         
-        vx[i] = new_vx;
-        vy[i] = new_vy;
-        vz[i] = new_vz;
+        // Reduce within warp using shuffle - no sync needed
+        for (int offset = 32; offset > 0; offset /= 2) {
+            val_x += __shfl_down(val_x, offset);
+            val_y += __shfl_down(val_y, offset);
+            val_z += __shfl_down(val_z, offset);
+        }
         
-        out_qx[i] = in_qx[i] + new_vx * d_dt;
-        out_qy[i] = in_qy[i] + new_vy * d_dt;
-        out_qz[i] = in_qz[i] + new_vz * d_dt;
-        
-        if (i == 0 && min_dist != nullptr) {
-            double pdx = in_qx[planet] - in_qx[asteroid];
-            double pdy = in_qy[planet] - in_qy[asteroid];
-            double pdz = in_qz[planet] - in_qz[asteroid];
-            double dist = sqrt(pdx * pdx + pdy * pdy + pdz * pdz);
-            atomicMin(min_dist, dist);
+        // Thread 0 has the final sum
+        if (j == 0) {
+            double new_vx = vx[i] + val_x * d_dt;
+            double new_vy = vy[i] + val_y * d_dt;
+            double new_vz = vz[i] + val_z * d_dt;
+            
+            vx[i] = new_vx;
+            vy[i] = new_vy;
+            vz[i] = new_vz;
+            
+            out_qx[i] = in_qx[i] + new_vx * d_dt;
+            out_qy[i] = in_qy[i] + new_vy * d_dt;
+            out_qz[i] = in_qz[i] + new_vz * d_dt;
+            
+            if (i == 0 && min_dist != nullptr) {
+                double pdx = in_qx[planet] - in_qx[asteroid];
+                double pdy = in_qy[planet] - in_qy[asteroid];
+                double pdz = in_qz[planet] - in_qz[asteroid];
+                double dist = sqrt(pdx * pdx + pdy * pdy + pdz * pdz);
+                atomicMin(min_dist, dist);
+            }
         }
     }
 }
