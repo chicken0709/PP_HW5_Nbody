@@ -320,6 +320,115 @@ __global__ void check_hit_and_destroy(int planet, int asteroid, int target_devic
     }
 }
 
+// Merged kernel for Problem 3: compute forces, integrate, and check hit/destroy
+__global__ void compute_forces_integrate_and_destroy(int n, const double* in_qx, const double* in_qy, const double* in_qz,
+                                                      double* m, int* type, double t, int step,
+                                                      double* vx, double* vy, double* vz,
+                                                      double* out_qx, double* out_qy, double* out_qz,
+                                                      int planet, int asteroid, int target_device,
+                                                      int* hit_step, int* destroyed_step) {
+    extern __shared__ double shared_mem[];
+    double* sx = shared_mem;
+    double* sy = shared_mem + n;
+    double* sz = shared_mem + 2 * n;
+
+    int i = blockIdx.x;
+    int j = threadIdx.x;
+
+    // Update mass for devices
+    if (type[j] == 2) {
+        double tmp = d_m0[j];
+        m[j] = tmp + 0.5 * tmp * fabs(sin(t / 6000.0));
+    }
+    __syncthreads();
+
+    double in_qx_i = in_qx[i];
+    double in_qy_i = in_qy[i];
+    double in_qz_i = in_qz[i];
+
+    double dx = in_qx[j] - in_qx_i;
+    double dy = in_qy[j] - in_qy_i;
+    double dz = in_qz[j] - in_qz_i;
+    double dist2 = dx * dx + dy * dy + dz * dz + d_eps * d_eps;
+    double invDist = rsqrt(dist2);
+    double invDist3 = invDist * invDist * invDist;
+    double common = d_G * m[j] * invDist3;
+
+    sx[j] = common * dx;
+    sy[j] = common * dy;
+    sz[j] = common * dz;
+
+    __syncthreads();
+
+    // Shared memory reduction until we have 64 or fewer elements
+    unsigned int len = blockDim.x;
+    while (len > 64) {
+        unsigned int stride = (len + 1) / 2;
+        if (j < len / 2) {
+            sx[j] += sx[j + stride];
+            sy[j] += sy[j + stride];
+            sz[j] += sz[j + stride];
+        }
+        len = stride;
+        __syncthreads();
+    }
+
+    // Warp-level reduction for last 64 elements (warp size on AMD)
+    if (j < 64) {
+        double val_x = sx[j];
+        double val_y = sy[j];
+        double val_z = sz[j];
+        
+        // Reduce within warp using shuffle - no sync needed
+        for (int offset = 32; offset > 0; offset /= 2) {
+            val_x += __shfl_down(val_x, offset);
+            val_y += __shfl_down(val_y, offset);
+            val_z += __shfl_down(val_z, offset);
+        }
+        
+        // Thread 0 has the final sum
+        if (j == 0) {
+            double new_vx = vx[i] + val_x * d_dt;
+            double new_vy = vy[i] + val_y * d_dt;
+            double new_vz = vz[i] + val_z * d_dt;
+            
+            vx[i] = new_vx;
+            vy[i] = new_vy;
+            vz[i] = new_vz;
+            
+            out_qx[i] = in_qx_i + new_vx * d_dt;
+            out_qy[i] = in_qy_i + new_vy * d_dt;
+            out_qz[i] = in_qz_i + new_vz * d_dt;
+        }
+    }
+    
+    // Only block 0 does the hit and destroy checks on INPUT positions
+    if (i == 0 && j == 0) {
+        if (*hit_step == -1) {
+            double dx = in_qx[planet] - in_qx[asteroid];
+            double dy = in_qy[planet] - in_qy[asteroid];
+            double dz = in_qz[planet] - in_qz[asteroid];
+            if (dx * dx + dy * dy + dz * dz < d_planet_radius * d_planet_radius) {
+                *hit_step = step - 1;  // Hit detected at previous step's positions
+            }
+        }
+
+        if (*destroyed_step == -1) {
+            double dx = in_qx[planet] - in_qx[target_device];
+            double dy = in_qy[planet] - in_qy[target_device];
+            double dz = in_qz[planet] - in_qz[target_device];
+            double dist = sqrt(dx * dx + dy * dy + dz * dz);
+            
+            double missile_dist = (step - 1) * d_dt * d_missile_speed;
+            if (missile_dist > dist) {
+                *destroyed_step = step - 1;
+                type[target_device] = 3; // destroyed
+                m[target_device] = 0.0;
+            }
+        }
+    }
+}
+
 struct Data {
     std::vector<double> qx, qy, qz, vx, vy, vz, m;
     std::vector<int> type;
@@ -692,19 +801,19 @@ int main(int argc, char** argv) {
             int blockSize = 1024;
             int numBlocks = (ctx.n + blockSize - 1) / blockSize;
 
-            // Step start_step
+            // Step start_step - check initial state
             check_hit_and_destroy<<<1, 1>>>(ctx.planet, ctx.asteroid, d_idx, d_qx[in], d_qy[in], d_qz[in], d_m, d_type, start_step, d_hit_step, d_destroyed_step);
 
             size_t shared_mem_size = 3 * ctx.n * sizeof(double);
             for (int step = start_step + 1; step <= param::n_steps; step++) {
-                compute_forces_and_integrate<<<ctx.n, ctx.n, shared_mem_size>>>(ctx.n,
+                // Use merged kernel that computes forces, integrates, and checks hit/destroy
+                compute_forces_integrate_and_destroy<<<ctx.n, ctx.n, shared_mem_size>>>(ctx.n,
                     d_qx[in], d_qy[in], d_qz[in],
-                    d_m, d_type, step * param::dt,
+                    d_m, d_type, step * param::dt, step,
                     d_vx, d_vy, d_vz,
                     d_qx[out], d_qy[out], d_qz[out],
-                    ctx.planet, ctx.asteroid, nullptr);
-
-                check_hit_and_destroy<<<1, 1>>>(ctx.planet, ctx.asteroid, d_idx, d_qx[out], d_qy[out], d_qz[out], d_m, d_type, step, d_hit_step, d_destroyed_step);
+                    ctx.planet, ctx.asteroid, d_idx,
+                    d_hit_step, d_destroyed_step);
 
                 std::swap(in, out);
 
@@ -714,6 +823,9 @@ int main(int argc, char** argv) {
                     if (h_hit_step != -1) break;
                 }
             }
+            
+            // Check final step positions
+            check_hit_and_destroy<<<1, 1>>>(ctx.planet, ctx.asteroid, d_idx, d_qx[in], d_qy[in], d_qz[in], d_m, d_type, param::n_steps, d_hit_step, d_destroyed_step);
             
             int h_hit_step, h_destroyed_step;
             HIP_CHECK(hipMemcpy(&h_hit_step, d_hit_step, sizeof(int), hipMemcpyDeviceToHost));
