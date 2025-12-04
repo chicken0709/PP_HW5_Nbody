@@ -139,6 +139,125 @@ __global__ void compute_forces_and_integrate(int n, const double* in_qx, const d
     }
 }
 
+// Merged kernel for Problem 2: compute forces, integrate, and check hits/reachability
+__global__ void compute_forces_integrate_and_check(int n, const double* in_qx, const double* in_qy, const double* in_qz,
+                                                    double* m, const int* type, double t, int step,
+                                                    double* vx, double* vy, double* vz,
+                                                    double* out_qx, double* out_qy, double* out_qz,
+                                                    int planet, int asteroid,
+                                                    int* hit_step, int* device_reached, double* device_dist) {
+    extern __shared__ double shared_mem[];
+    double* sx = shared_mem;
+    double* sy = shared_mem + n;
+    double* sz = shared_mem + 2 * n;
+
+    int i = blockIdx.x;
+    int j = threadIdx.x;
+
+    // Update mass for devices
+    if (type[j] == 2) {
+        double tmp = d_m0[j];
+        m[j] = tmp + 0.5 * tmp * fabs(sin(t / 6000.0));
+    }
+    __syncthreads();
+
+    double in_qx_i = in_qx[i];
+    double in_qy_i = in_qy[i];
+    double in_qz_i = in_qz[i];
+
+    double dx = in_qx[j] - in_qx_i;
+    double dy = in_qy[j] - in_qy_i;
+    double dz = in_qz[j] - in_qz_i;
+    double dist2 = dx * dx + dy * dy + dz * dz + d_eps * d_eps;
+    double invDist = rsqrt(dist2);
+    double invDist3 = invDist * invDist * invDist;
+    double common = d_G * m[j] * invDist3;
+
+    sx[j] = common * dx;
+    sy[j] = common * dy;
+    sz[j] = common * dz;
+
+    __syncthreads();
+
+    // Shared memory reduction until we have 64 or fewer elements
+    unsigned int len = blockDim.x;
+    while (len > 64) {
+        unsigned int stride = (len + 1) / 2;
+        if (j < len / 2) {
+            sx[j] += sx[j + stride];
+            sy[j] += sy[j + stride];
+            sz[j] += sz[j + stride];
+        }
+        len = stride;
+        __syncthreads();
+    }
+
+    // Warp-level reduction for last 64 elements (warp size on AMD)
+    if (j < 64) {
+        double val_x = sx[j];
+        double val_y = sy[j];
+        double val_z = sz[j];
+        
+        // Reduce within warp using shuffle - no sync needed
+        for (int offset = 32; offset > 0; offset /= 2) {
+            val_x += __shfl_down(val_x, offset);
+            val_y += __shfl_down(val_y, offset);
+            val_z += __shfl_down(val_z, offset);
+        }
+        
+        // Thread 0 has the final sum
+        if (j == 0) {
+            double new_vx = vx[i] + val_x * d_dt;
+            double new_vy = vy[i] + val_y * d_dt;
+            double new_vz = vz[i] + val_z * d_dt;
+            
+            vx[i] = new_vx;
+            vy[i] = new_vy;
+            vz[i] = new_vz;
+            
+            double out_x = in_qx_i + new_vx * d_dt;
+            double out_y = in_qy_i + new_vy * d_dt;
+            double out_z = in_qz_i + new_vz * d_dt;
+            
+            out_qx[i] = out_x;
+            out_qy[i] = out_y;
+            out_qz[i] = out_z;
+        }
+    }
+    
+    // Only block 0 does the hit and reachability checks on INPUT positions
+    // (checking input avoids cross-block synchronization issues)
+    if (i == 0) {
+        // Check planet-asteroid collision (only thread 0)
+        if (j == 0) {
+            if (*hit_step == -1) {
+                double dx = in_qx[planet] - in_qx[asteroid];
+                double dy = in_qy[planet] - in_qy[asteroid];
+                double dz = in_qz[planet] - in_qz[asteroid];
+                if (dx * dx + dy * dy + dz * dz < d_planet_radius * d_planet_radius) {
+                    *hit_step = step - 1;  // Hit detected at previous step's positions
+                }
+            }
+        }
+
+        // Check device reachability on input positions
+        if (type[j] == 2) {
+            if (device_reached[j] == -1) {
+                double dx = in_qx[planet] - in_qx[j];
+                double dy = in_qy[planet] - in_qy[j];
+                double dz = in_qz[planet] - in_qz[j];
+                double dist = sqrt(dx * dx + dy * dy + dz * dz);
+                
+                double missile_dist = (step - 1) * d_dt * d_missile_speed;
+                if (missile_dist > dist) {
+                    device_reached[j] = step - 1;
+                    device_dist[j] = dist;
+                }
+            }
+        }
+    }
+}
+
 __global__ void check_hits_and_reachable(int n, int planet, int asteroid, double* qx, double* qy, double* qz, 
                                          int* type, int step, int* hit_step,
                                          int* device_reached, double* device_dist) {
@@ -397,19 +516,20 @@ int main(int argc, char** argv) {
         int in = 0;
         int out = 1;
 
-        // Step 0
+        // Step 0 - check initial state
         check_hits_and_reachable<<<1, ctx.n>>>(ctx.n, ctx.planet, ctx.asteroid, d_qx[in], d_qy[in], d_qz[in], d_type, 0, d_hit_step, d_device_reached, d_device_dist);
 
         size_t shared_mem_size = 3 * ctx.n * sizeof(double);
         for (int step = 1; step <= param::n_steps; step++) {
-            compute_forces_and_integrate<<<ctx.n, ctx.n, shared_mem_size>>>(ctx.n,
+            // Use merged kernel that computes forces, integrates, and checks hits/reachability
+            // Note: the check is done on INPUT positions (step-1), so we need to check final step separately
+            compute_forces_integrate_and_check<<<ctx.n, ctx.n, shared_mem_size>>>(ctx.n,
                 d_qx[in], d_qy[in], d_qz[in],
-                d_m, d_type, step * param::dt,
+                d_m, d_type, step * param::dt, step,
                 d_vx, d_vy, d_vz,
                 d_qx[out], d_qy[out], d_qz[out],
-                ctx.planet, ctx.asteroid, nullptr);
-
-            check_hits_and_reachable<<<1, ctx.n>>>(ctx.n, ctx.planet, ctx.asteroid, d_qx[out], d_qy[out], d_qz[out], d_type, step, d_hit_step, d_device_reached, d_device_dist);
+                ctx.planet, ctx.asteroid,
+                d_hit_step, d_device_reached, d_device_dist);
 
             std::swap(in, out);
 
@@ -451,6 +571,9 @@ int main(int argc, char** argv) {
                 if (h_hit_step != -1) break;
             }
         }
+        
+        // Check final step positions (since merged kernel checks input positions)
+        check_hits_and_reachable<<<1, ctx.n>>>(ctx.n, ctx.planet, ctx.asteroid, d_qx[in], d_qy[in], d_qz[in], d_type, param::n_steps, d_hit_step, d_device_reached, d_device_dist);
         
         // Final check for any remaining devices
         HIP_CHECK(hipMemcpy(h_device_reached.data(), d_device_reached, ctx.n * sizeof(int), hipMemcpyDeviceToHost));
