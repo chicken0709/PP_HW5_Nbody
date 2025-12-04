@@ -122,10 +122,12 @@ __global__ void compute_forces_and_integrate(int n, const double* in_qx, const d
     }
 }
 
-__global__ void check_hits(int n, int planet, int asteroid, double* qx, double* qy, double* qz, int* type, int step, int* hit_step) {
+__global__ void check_hits_and_reachable(int n, int planet, int asteroid, double* qx, double* qy, double* qz, 
+                                         int* type, int step, int* hit_step,
+                                         int* device_reached, double* device_dist) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
 
-    // Check planet-asteroid collision
+    // Check planet-asteroid collision (only thread 0)
     if (i == 0) {
         if (*hit_step == -1) {
             double dx = qx[planet] - qx[asteroid];
@@ -136,11 +138,8 @@ __global__ void check_hits(int n, int planet, int asteroid, double* qx, double* 
             }
         }
     }
-}
 
-__global__ void check_device_reachable(int n, int planet, double* qx, double* qy, double* qz, int* type, int step,
-                                       int* device_reached, double* device_dist) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    // Check device reachability
     if (i < n && type[i] == 2) {
         if (device_reached[i] != -1) return;
 
@@ -381,8 +380,7 @@ int main(int argc, char** argv) {
         int out = 1;
 
         // Step 0
-        check_hits<<<numBlocks, blockSize>>>(ctx.n, ctx.planet, ctx.asteroid, d_qx[in], d_qy[in], d_qz[in], d_type, 0, d_hit_step);
-        check_device_reachable<<<numBlocks, blockSize>>>(ctx.n, ctx.planet, d_qx[in], d_qy[in], d_qz[in], d_type, 0, d_device_reached, d_device_dist);
+        check_hits_and_reachable<<<numBlocks, blockSize>>>(ctx.n, ctx.planet, ctx.asteroid, d_qx[in], d_qy[in], d_qz[in], d_type, 0, d_hit_step, d_device_reached, d_device_dist);
 
         size_t shared_mem_size = 3 * ctx.n * sizeof(double);
         for (int step = 1; step <= param::n_steps; step++) {
@@ -394,8 +392,7 @@ int main(int argc, char** argv) {
                 d_qx[out], d_qy[out], d_qz[out],
                 ctx.planet, ctx.asteroid, nullptr);
 
-            check_hits<<<numBlocks, blockSize>>>(ctx.n, ctx.planet, ctx.asteroid, d_qx[out], d_qy[out], d_qz[out], d_type, step, d_hit_step);
-            check_device_reachable<<<numBlocks, blockSize>>>(ctx.n, ctx.planet, d_qx[out], d_qy[out], d_qz[out], d_type, step, d_device_reached, d_device_dist);
+            check_hits_and_reachable<<<numBlocks, blockSize>>>(ctx.n, ctx.planet, ctx.asteroid, d_qx[out], d_qy[out], d_qz[out], d_type, step, d_hit_step, d_device_reached, d_device_dist);
 
             std::swap(in, out);
 
