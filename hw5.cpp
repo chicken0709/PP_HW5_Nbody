@@ -298,7 +298,7 @@ int main(int argc, char** argv) {
         double init_min_dist = std::numeric_limits<double>::infinity();
         HIP_CHECK(hipMemcpy(d_min_dist, &init_min_dist, sizeof(double), hipMemcpyHostToDevice));
 
-        int blockSize = 256;
+        int blockSize = 1024;
         int numBlocks = (ctx.n + blockSize - 1) / blockSize;
         
         int n_steps = param::n_steps;
@@ -373,7 +373,7 @@ int main(int argc, char** argv) {
         // Track which devices we've saved state for
         std::vector<bool> device_saved(ctx.n, false);
         
-        int blockSize = 256;
+        int blockSize = 1024;
         int numBlocks = (ctx.n + blockSize - 1) / blockSize;
 
         int in = 0;
@@ -503,7 +503,7 @@ int main(int argc, char** argv) {
         HIP_CHECK(hipSetDevice(gpu_id));
         setup_gpu_constants(ctx.m);
 
-        int blockSize = 256;
+        int blockSize = 1024;
         int numBlocks = (ctx.n + blockSize - 1) / blockSize;
 
         double *d_qx[2], *d_qy[2], *d_qz[2];
@@ -549,7 +549,7 @@ int main(int argc, char** argv) {
 
             int in = 0;
             int out = 1;
-            int blockSize = 256;
+            int blockSize = 1024;
             int numBlocks = (ctx.n + blockSize - 1) / blockSize;
 
             // Step start_step
