@@ -413,7 +413,7 @@ int main(int argc, char** argv) {
             std::swap(in, out);
 
             // Check periodically for newly reachable devices and save their states
-            if (step % 100 == 0) {
+            if (step % 1000 == 0) {
                 HIP_CHECK(hipMemcpy(h_device_reached.data(), d_device_reached, ctx.n * sizeof(int), hipMemcpyDeviceToHost));
                 HIP_CHECK(hipMemcpy(h_device_dist.data(), d_device_dist, ctx.n * sizeof(double), hipMemcpyDeviceToHost));
                 
