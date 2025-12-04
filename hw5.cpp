@@ -8,6 +8,8 @@
 #include <vector>
 #include <thread>
 #include <mutex>
+#include <algorithm>
+#include <atomic>
 #include <hip/hip_runtime.h>
 
 #define HIP_CHECK(cmd) \
@@ -57,8 +59,10 @@ __global__ void check_min_dist(int planet, int asteroid, double* qx, double* qy,
     }
 }
 
-__global__ void compute_forces(int n, const double* qx, const double* qy, const double* qz,
-                               const double* m, double* vx, double* vy, double* vz) {
+__global__ void compute_forces_and_integrate(int n, const double* in_qx, const double* in_qy, const double* in_qz,
+                                              const double* m, double* vx, double* vy, double* vz,
+                                              double* out_qx, double* out_qy, double* out_qz,
+                                              int planet, int asteroid, double* min_dist) {
     extern __shared__ double shared_mem[];
     double* sx = shared_mem;
     double* sy = shared_mem + n;
@@ -67,9 +71,9 @@ __global__ void compute_forces(int n, const double* qx, const double* qy, const 
     int i = blockIdx.x;
     int j = threadIdx.x;
 
-    double dx = qx[j] - qx[i];
-    double dy = qy[j] - qy[i];
-    double dz = qz[j] - qz[i];
+    double dx = in_qx[j] - in_qx[i];
+    double dy = in_qy[j] - in_qy[i];
+    double dz = in_qz[j] - in_qz[i];
     double dist2 = dx * dx + dy * dy + dz * dz + d_eps * d_eps;
     double invDist = rsqrt(dist2);
     double invDist3 = invDist * invDist * invDist;
@@ -93,36 +97,32 @@ __global__ void compute_forces(int n, const double* qx, const double* qy, const 
         len = stride;
     }
 
+    __syncthreads();
+
     if (j == 0) {
-        vx[i] += sx[0] * d_dt;
-        vy[i] += sy[0] * d_dt;
-        vz[i] += sz[0] * d_dt;
+        double new_vx = vx[i] + sx[0] * d_dt;
+        double new_vy = vy[i] + sy[0] * d_dt;
+        double new_vz = vz[i] + sz[0] * d_dt;
+        
+        vx[i] = new_vx;
+        vy[i] = new_vy;
+        vz[i] = new_vz;
+        
+        out_qx[i] = in_qx[i] + new_vx * d_dt;
+        out_qy[i] = in_qy[i] + new_vy * d_dt;
+        out_qz[i] = in_qz[i] + new_vz * d_dt;
+        
+        if (i == 0 && min_dist != nullptr) {
+            double pdx = in_qx[planet] - in_qx[asteroid];
+            double pdy = in_qy[planet] - in_qy[asteroid];
+            double pdz = in_qz[planet] - in_qz[asteroid];
+            double dist = sqrt(pdx * pdx + pdy * pdy + pdz * pdz);
+            atomicMin(min_dist, dist);
+        }
     }
 }
 
-__global__ void integrate_step(int n, const double* in_qx, const double* in_qy, const double* in_qz,
-                               const double* vx, const double* vy, const double* vz,
-                               double* out_qx, double* out_qy, double* out_qz,
-                               int planet, int asteroid, double* min_dist) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) {
-        return;
-    }
-
-    if (i == 0 && min_dist != nullptr) {
-        double dx = in_qx[planet] - in_qx[asteroid];
-        double dy = in_qy[planet] - in_qy[asteroid];
-        double dz = in_qz[planet] - in_qz[asteroid];
-        double dist = sqrt(dx * dx + dy * dy + dz * dz);
-        atomicMin(min_dist, dist);
-    }
-
-    out_qx[i] = in_qx[i] + vx[i] * d_dt;
-    out_qy[i] = in_qy[i] + vy[i] * d_dt;
-    out_qz[i] = in_qz[i] + vz[i] * d_dt;
-}
-
-__global__ void check_hits(int n, int planet, int asteroid, double* qx, double* qy, double* qz, int* type, int step, int* saved_step, int* hit_step) {
+__global__ void check_hits(int n, int planet, int asteroid, double* qx, double* qy, double* qz, int* type, int step, int* hit_step) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
 
     // Check planet-asteroid collision
@@ -136,10 +136,13 @@ __global__ void check_hits(int n, int planet, int asteroid, double* qx, double* 
             }
         }
     }
+}
 
-    // Check missile-device hit
+__global__ void check_device_reachable(int n, int planet, double* qx, double* qy, double* qz, int* type, int step,
+                                       int* device_reached, double* device_dist) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n && type[i] == 2) {
-        if (*saved_step != -1) return;
+        if (device_reached[i] != -1) return;
 
         double dx = qx[planet] - qx[i];
         double dy = qy[planet] - qy[i];
@@ -148,28 +151,8 @@ __global__ void check_hits(int n, int planet, int asteroid, double* qx, double* 
         
         double missile_dist = step * d_dt * d_missile_speed;
         if (missile_dist > dist) {
-            atomicCAS(saved_step, -1, step);
-        }
-    }
-}
-
-__global__ void save_state(int n, double* qx, double* qy, double* qz,
-                                  double* vx, double* vy, double* vz,
-                                  double* m, int* type, int step, int* saved_step,
-                                  double* s_qx, double* s_qy, double* s_qz,
-                                  double* s_vx, double* s_vy, double* s_vz,
-                                  double* s_m, int* s_type) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        if (*saved_step == step) {
-            s_qx[i] = qx[i];
-            s_qy[i] = qy[i];
-            s_qz[i] = qz[i];
-            s_vx[i] = vx[i];
-            s_vy[i] = vy[i];
-            s_vz[i] = vz[i];
-            s_m[i] = m[i];
-            s_type[i] = type[i];
+            device_reached[i] = step;
+            device_dist[i] = dist;
         }
     }
 }
@@ -206,6 +189,14 @@ struct Data {
     std::vector<double> qx, qy, qz, vx, vy, vz, m;
     std::vector<int> type;
     int n, planet, asteroid;
+};
+
+struct DeviceState {
+    int device_id;
+    int step;
+    double distance;
+    std::vector<double> qx, qy, qz, vx, vy, vz, m;
+    std::vector<int> type;
 };
 
 void read_input(const char* filename, Data& ctx) {
@@ -260,18 +251,8 @@ int main(int argc, char** argv) {
     Data ctx;
     read_input(argv[1], ctx);
 
-    std::vector<double> saved_qx, saved_qy, saved_qz, saved_vx, saved_vy, saved_vz, saved_m;
-    std::vector<int> saved_type;
-    int saved_step = -1;
-    
-    saved_qx.resize(ctx.n);
-    saved_qy.resize(ctx.n);
-    saved_qz.resize(ctx.n);
-    saved_vx.resize(ctx.n);
-    saved_vy.resize(ctx.n);
-    saved_vz.resize(ctx.n);
-    saved_m.resize(ctx.n);
-    saved_type.resize(ctx.n);
+    std::vector<DeviceState> device_states;
+    std::mutex device_states_mutex;
 
     // Problem 1 & 2
     double min_dist = std::numeric_limits<double>::infinity();
@@ -328,13 +309,9 @@ int main(int argc, char** argv) {
         int out = 1;
         size_t shared_mem_size = 3 * ctx.n * sizeof(double);
         for (int step = 1; step <= n_steps; step++) {
-            compute_forces<<<ctx.n, ctx.n, shared_mem_size>>>(ctx.n,
+            compute_forces_and_integrate<<<ctx.n, ctx.n, shared_mem_size>>>(ctx.n,
                 d_qx[in], d_qy[in], d_qz[in],
-                d_m, d_vx, d_vy, d_vz);
-
-            integrate_step<<<numBlocks, blockSize>>>(ctx.n,
-                d_qx[in], d_qy[in], d_qz[in],
-                d_vx, d_vy, d_vz,
+                d_m, d_vx, d_vy, d_vz,
                 d_qx[out], d_qy[out], d_qz[out],
                 ctx.planet, ctx.asteroid, d_min_dist);
             std::swap(in, out);
@@ -358,9 +335,8 @@ int main(int argc, char** argv) {
         double *d_vx, *d_vy, *d_vz;
         double *d_m;
         int *d_type, *d_hit_step;
-        
-        double *d_saved_qx, *d_saved_qy, *d_saved_qz, *d_saved_vx, *d_saved_vy, *d_saved_vz, *d_saved_m;
-        int *d_saved_type, *d_saved_step;
+        int *d_device_reached;
+        double *d_device_dist;
         
         for(int k = 0; k < 2; k++) {
             HIP_CHECK(hipMalloc(&d_qx[k], ctx.n * sizeof(double)));
@@ -374,16 +350,8 @@ int main(int argc, char** argv) {
         HIP_CHECK(hipMalloc(&d_m, ctx.n * sizeof(double)));
         HIP_CHECK(hipMalloc(&d_type, ctx.n * sizeof(int)));
         HIP_CHECK(hipMalloc(&d_hit_step, sizeof(int)));
-
-        HIP_CHECK(hipMalloc(&d_saved_qx, ctx.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_saved_qy, ctx.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_saved_qz, ctx.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_saved_vx, ctx.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_saved_vy, ctx.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_saved_vz, ctx.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_saved_m, ctx.n * sizeof(double)));
-        HIP_CHECK(hipMalloc(&d_saved_type, ctx.n * sizeof(int)));
-        HIP_CHECK(hipMalloc(&d_saved_step, sizeof(int)));
+        HIP_CHECK(hipMalloc(&d_device_reached, ctx.n * sizeof(int)));
+        HIP_CHECK(hipMalloc(&d_device_dist, ctx.n * sizeof(double)));
 
         HIP_CHECK(hipMemcpy(d_qx[0], ctx.qx.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
         HIP_CHECK(hipMemcpy(d_qy[0], ctx.qy.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
@@ -396,7 +364,15 @@ int main(int argc, char** argv) {
         
         int init_hit_step = -1;
         HIP_CHECK(hipMemcpy(d_hit_step, &init_hit_step, sizeof(int), hipMemcpyHostToDevice));
-        HIP_CHECK(hipMemcpy(d_saved_step, &init_hit_step, sizeof(int), hipMemcpyHostToDevice));
+        
+        // Initialize device_reached to -1 for all
+        std::vector<int> h_device_reached(ctx.n, -1);
+        std::vector<double> h_device_dist(ctx.n, std::numeric_limits<double>::infinity());
+        HIP_CHECK(hipMemcpy(d_device_reached, h_device_reached.data(), ctx.n * sizeof(int), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(d_device_dist, h_device_dist.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+        
+        // Track which devices we've saved state for
+        std::vector<bool> device_saved(ctx.n, false);
         
         int blockSize = 256;
         int numBlocks = (ctx.n + blockSize - 1) / blockSize;
@@ -405,35 +381,91 @@ int main(int argc, char** argv) {
         int out = 1;
 
         // Step 0
-        check_hits<<<numBlocks, blockSize>>>(ctx.n, ctx.planet, ctx.asteroid, d_qx[in], d_qy[in], d_qz[in], d_type, 0, d_saved_step, d_hit_step);
-        save_state<<<numBlocks, blockSize>>>(ctx.n, d_qx[in], d_qy[in], d_qz[in], d_vx, d_vy, d_vz, d_m, d_type, 0, d_saved_step,
-            d_saved_qx, d_saved_qy, d_saved_qz, d_saved_vx, d_saved_vy, d_saved_vz, d_saved_m, d_saved_type);
+        check_hits<<<numBlocks, blockSize>>>(ctx.n, ctx.planet, ctx.asteroid, d_qx[in], d_qy[in], d_qz[in], d_type, 0, d_hit_step);
+        check_device_reachable<<<numBlocks, blockSize>>>(ctx.n, ctx.planet, d_qx[in], d_qy[in], d_qz[in], d_type, 0, d_device_reached, d_device_dist);
 
         size_t shared_mem_size = 3 * ctx.n * sizeof(double);
         for (int step = 1; step <= param::n_steps; step++) {
             update_mass<<<numBlocks, blockSize>>>(ctx.n, d_m, d_type, step * param::dt);
 
-            compute_forces<<<ctx.n, ctx.n, shared_mem_size>>>(ctx.n,
+            compute_forces_and_integrate<<<ctx.n, ctx.n, shared_mem_size>>>(ctx.n,
                 d_qx[in], d_qy[in], d_qz[in],
-                d_m, d_vx, d_vy, d_vz);
-
-            integrate_step<<<numBlocks, blockSize>>>(ctx.n,
-                d_qx[in], d_qy[in], d_qz[in],
-                d_vx, d_vy, d_vz,
+                d_m, d_vx, d_vy, d_vz,
                 d_qx[out], d_qy[out], d_qz[out],
                 ctx.planet, ctx.asteroid, nullptr);
 
-            check_hits<<<numBlocks, blockSize>>>(ctx.n, ctx.planet, ctx.asteroid, d_qx[out], d_qy[out], d_qz[out], d_type, step, d_saved_step, d_hit_step);
-
-            save_state<<<numBlocks, blockSize>>>(ctx.n, d_qx[out], d_qy[out], d_qz[out], d_vx, d_vy, d_vz, d_m, d_type, step, d_saved_step,
-                d_saved_qx, d_saved_qy, d_saved_qz, d_saved_vx, d_saved_vy, d_saved_vz, d_saved_m, d_saved_type);
+            check_hits<<<numBlocks, blockSize>>>(ctx.n, ctx.planet, ctx.asteroid, d_qx[out], d_qy[out], d_qz[out], d_type, step, d_hit_step);
+            check_device_reachable<<<numBlocks, blockSize>>>(ctx.n, ctx.planet, d_qx[out], d_qy[out], d_qz[out], d_type, step, d_device_reached, d_device_dist);
 
             std::swap(in, out);
 
-            if (step % 2000 == 0) {
+            // Check periodically for newly reachable devices and save their states
+            if (step % 100 == 0) {
+                HIP_CHECK(hipMemcpy(h_device_reached.data(), d_device_reached, ctx.n * sizeof(int), hipMemcpyDeviceToHost));
+                HIP_CHECK(hipMemcpy(h_device_dist.data(), d_device_dist, ctx.n * sizeof(double), hipMemcpyDeviceToHost));
+                
+                for (int i = 0; i < ctx.n; i++) {
+                    if (ctx.type[i] == 2 && h_device_reached[i] != -1 && !device_saved[i]) {
+                        // Save state for this device
+                        DeviceState ds;
+                        ds.device_id = i;
+                        ds.step = h_device_reached[i];
+                        ds.distance = h_device_dist[i];
+                        ds.qx.resize(ctx.n); ds.qy.resize(ctx.n); ds.qz.resize(ctx.n);
+                        ds.vx.resize(ctx.n); ds.vy.resize(ctx.n); ds.vz.resize(ctx.n);
+                        ds.m.resize(ctx.n); ds.type.resize(ctx.n);
+                        
+                        HIP_CHECK(hipMemcpy(ds.qx.data(), d_qx[in], ctx.n * sizeof(double), hipMemcpyDeviceToHost));
+                        HIP_CHECK(hipMemcpy(ds.qy.data(), d_qy[in], ctx.n * sizeof(double), hipMemcpyDeviceToHost));
+                        HIP_CHECK(hipMemcpy(ds.qz.data(), d_qz[in], ctx.n * sizeof(double), hipMemcpyDeviceToHost));
+                        HIP_CHECK(hipMemcpy(ds.vx.data(), d_vx, ctx.n * sizeof(double), hipMemcpyDeviceToHost));
+                        HIP_CHECK(hipMemcpy(ds.vy.data(), d_vy, ctx.n * sizeof(double), hipMemcpyDeviceToHost));
+                        HIP_CHECK(hipMemcpy(ds.vz.data(), d_vz, ctx.n * sizeof(double), hipMemcpyDeviceToHost));
+                        HIP_CHECK(hipMemcpy(ds.m.data(), d_m, ctx.n * sizeof(double), hipMemcpyDeviceToHost));
+                        HIP_CHECK(hipMemcpy(ds.type.data(), d_type, ctx.n * sizeof(int), hipMemcpyDeviceToHost));
+                        
+                        {
+                            std::lock_guard<std::mutex> lock(device_states_mutex);
+                            device_states.push_back(std::move(ds));
+                        }
+                        device_saved[i] = true;
+                    }
+                }
+                
                 int h_hit_step;
                 HIP_CHECK(hipMemcpy(&h_hit_step, d_hit_step, sizeof(int), hipMemcpyDeviceToHost));
                 if (h_hit_step != -1) break;
+            }
+        }
+        
+        // Final check for any remaining devices
+        HIP_CHECK(hipMemcpy(h_device_reached.data(), d_device_reached, ctx.n * sizeof(int), hipMemcpyDeviceToHost));
+        HIP_CHECK(hipMemcpy(h_device_dist.data(), d_device_dist, ctx.n * sizeof(double), hipMemcpyDeviceToHost));
+        
+        for (int i = 0; i < ctx.n; i++) {
+            if (ctx.type[i] == 2 && h_device_reached[i] != -1 && !device_saved[i]) {
+                DeviceState ds;
+                ds.device_id = i;
+                ds.step = h_device_reached[i];
+                ds.distance = h_device_dist[i];
+                ds.qx.resize(ctx.n); ds.qy.resize(ctx.n); ds.qz.resize(ctx.n);
+                ds.vx.resize(ctx.n); ds.vy.resize(ctx.n); ds.vz.resize(ctx.n);
+                ds.m.resize(ctx.n); ds.type.resize(ctx.n);
+                
+                HIP_CHECK(hipMemcpy(ds.qx.data(), d_qx[in], ctx.n * sizeof(double), hipMemcpyDeviceToHost));
+                HIP_CHECK(hipMemcpy(ds.qy.data(), d_qy[in], ctx.n * sizeof(double), hipMemcpyDeviceToHost));
+                HIP_CHECK(hipMemcpy(ds.qz.data(), d_qz[in], ctx.n * sizeof(double), hipMemcpyDeviceToHost));
+                HIP_CHECK(hipMemcpy(ds.vx.data(), d_vx, ctx.n * sizeof(double), hipMemcpyDeviceToHost));
+                HIP_CHECK(hipMemcpy(ds.vy.data(), d_vy, ctx.n * sizeof(double), hipMemcpyDeviceToHost));
+                HIP_CHECK(hipMemcpy(ds.vz.data(), d_vz, ctx.n * sizeof(double), hipMemcpyDeviceToHost));
+                HIP_CHECK(hipMemcpy(ds.m.data(), d_m, ctx.n * sizeof(double), hipMemcpyDeviceToHost));
+                HIP_CHECK(hipMemcpy(ds.type.data(), d_type, ctx.n * sizeof(int), hipMemcpyDeviceToHost));
+                
+                {
+                    std::lock_guard<std::mutex> lock(device_states_mutex);
+                    device_states.push_back(std::move(ds));
+                }
+                device_saved[i] = true;
             }
         }
         
@@ -443,18 +475,6 @@ int main(int argc, char** argv) {
         if (h_hit_step != -1) {
             hit_time_step = h_hit_step;
         }
-
-        HIP_CHECK(hipMemcpy(&saved_step, d_saved_step, sizeof(int), hipMemcpyDeviceToHost));
-        if (saved_step != -1) {
-            HIP_CHECK(hipMemcpy(saved_qx.data(), d_saved_qx, ctx.n * sizeof(double), hipMemcpyDeviceToHost));
-            HIP_CHECK(hipMemcpy(saved_qy.data(), d_saved_qy, ctx.n * sizeof(double), hipMemcpyDeviceToHost));
-            HIP_CHECK(hipMemcpy(saved_qz.data(), d_saved_qz, ctx.n * sizeof(double), hipMemcpyDeviceToHost));
-            HIP_CHECK(hipMemcpy(saved_vx.data(), d_saved_vx, ctx.n * sizeof(double), hipMemcpyDeviceToHost));
-            HIP_CHECK(hipMemcpy(saved_vy.data(), d_saved_vy, ctx.n * sizeof(double), hipMemcpyDeviceToHost));
-            HIP_CHECK(hipMemcpy(saved_vz.data(), d_saved_vz, ctx.n * sizeof(double), hipMemcpyDeviceToHost));
-            HIP_CHECK(hipMemcpy(saved_m.data(), d_saved_m, ctx.n * sizeof(double), hipMemcpyDeviceToHost));
-            HIP_CHECK(hipMemcpy(saved_type.data(), d_saved_type, ctx.n * sizeof(int), hipMemcpyDeviceToHost));
-        }
         
         for(int k = 0; k < 2; k++) {
             HIP_CHECK(hipFree(d_qx[k])); HIP_CHECK(hipFree(d_qy[k])); HIP_CHECK(hipFree(d_qz[k]));
@@ -462,9 +482,7 @@ int main(int argc, char** argv) {
         HIP_CHECK(hipFree(d_vx)); HIP_CHECK(hipFree(d_vy)); HIP_CHECK(hipFree(d_vz));
         HIP_CHECK(hipFree(d_m));
         HIP_CHECK(hipFree(d_type)); HIP_CHECK(hipFree(d_hit_step));
-        HIP_CHECK(hipFree(d_saved_qx)); HIP_CHECK(hipFree(d_saved_qy)); HIP_CHECK(hipFree(d_saved_qz));
-        HIP_CHECK(hipFree(d_saved_vx)); HIP_CHECK(hipFree(d_saved_vy)); HIP_CHECK(hipFree(d_saved_vz));
-        HIP_CHECK(hipFree(d_saved_m)); HIP_CHECK(hipFree(d_saved_type)); HIP_CHECK(hipFree(d_saved_step));
+        HIP_CHECK(hipFree(d_device_reached)); HIP_CHECK(hipFree(d_device_dist));
     });
 
     p1.join();
@@ -474,17 +492,17 @@ int main(int argc, char** argv) {
     int gravity_device_id = -1;
     double missile_cost = 0.0;
 
-    // Identify devices
-    std::vector<int> devices;
-    for(int i = 0; i < ctx.n; ++i) {
-        if(ctx.type[i] == 2) devices.push_back(i);
-    }
+    // Sort device_states by distance (smaller distance = lower missile cost)
+    std::sort(device_states.begin(), device_states.end(), [](const DeviceState& a, const DeviceState& b) {
+        return a.distance < b.distance;
+    });
 
+    std::atomic<bool> solution_found(false);
     double best_cost = std::numeric_limits<double>::infinity();
     int best_id = -1;
     std::mutex result_mutex;
 
-    auto worker = [&](int gpu_id, const std::vector<int>& device_subset) {
+    auto worker = [&](int gpu_id, const std::vector<size_t>& state_indices) {
         HIP_CHECK(hipSetDevice(gpu_id));
         setup_gpu_constants(ctx.m);
 
@@ -511,28 +529,22 @@ int main(int argc, char** argv) {
         HIP_CHECK(hipMalloc(&d_hit_step, sizeof(int)));
         HIP_CHECK(hipMalloc(&d_destroyed_step, sizeof(int)));
 
-        for (int d_idx : device_subset) {
-            int start_step = 0;
-            if (saved_step != -1) {
-                start_step = saved_step;
-                HIP_CHECK(hipMemcpy(d_qx[0], saved_qx.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
-                HIP_CHECK(hipMemcpy(d_qy[0], saved_qy.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
-                HIP_CHECK(hipMemcpy(d_qz[0], saved_qz.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
-                HIP_CHECK(hipMemcpy(d_vx, saved_vx.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
-                HIP_CHECK(hipMemcpy(d_vy, saved_vy.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
-                HIP_CHECK(hipMemcpy(d_vz, saved_vz.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
-                HIP_CHECK(hipMemcpy(d_m, saved_m.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
-                HIP_CHECK(hipMemcpy(d_type, saved_type.data(), ctx.n * sizeof(int), hipMemcpyHostToDevice));
-            } else {
-                HIP_CHECK(hipMemcpy(d_qx[0], ctx.qx.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
-                HIP_CHECK(hipMemcpy(d_qy[0], ctx.qy.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
-                HIP_CHECK(hipMemcpy(d_qz[0], ctx.qz.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
-                HIP_CHECK(hipMemcpy(d_vx, ctx.vx.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
-                HIP_CHECK(hipMemcpy(d_vy, ctx.vy.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
-                HIP_CHECK(hipMemcpy(d_vz, ctx.vz.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
-                HIP_CHECK(hipMemcpy(d_m, ctx.m.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
-                HIP_CHECK(hipMemcpy(d_type, ctx.type.data(), ctx.n * sizeof(int), hipMemcpyHostToDevice));
-            }
+        for (size_t idx : state_indices) {
+            // Early return if solution already found
+            if (solution_found.load()) break;
+            
+            const DeviceState& ds = device_states[idx];
+            int d_idx = ds.device_id;
+            int start_step = ds.step;
+            
+            HIP_CHECK(hipMemcpy(d_qx[0], ds.qx.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+            HIP_CHECK(hipMemcpy(d_qy[0], ds.qy.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+            HIP_CHECK(hipMemcpy(d_qz[0], ds.qz.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+            HIP_CHECK(hipMemcpy(d_vx, ds.vx.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+            HIP_CHECK(hipMemcpy(d_vy, ds.vy.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+            HIP_CHECK(hipMemcpy(d_vz, ds.vz.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+            HIP_CHECK(hipMemcpy(d_m, ds.m.data(), ctx.n * sizeof(double), hipMemcpyHostToDevice));
+            HIP_CHECK(hipMemcpy(d_type, ds.type.data(), ctx.n * sizeof(int), hipMemcpyHostToDevice));
             
             int init_val = -1;
             HIP_CHECK(hipMemcpy(d_hit_step, &init_val, sizeof(int), hipMemcpyHostToDevice));
@@ -550,13 +562,9 @@ int main(int argc, char** argv) {
             for (int step = start_step + 1; step <= param::n_steps; step++) {
                 update_mass<<<numBlocks, blockSize>>>(ctx.n, d_m, d_type, step * param::dt);
 
-                compute_forces<<<ctx.n, ctx.n, shared_mem_size>>>(ctx.n,
+                compute_forces_and_integrate<<<ctx.n, ctx.n, shared_mem_size>>>(ctx.n,
                     d_qx[in], d_qy[in], d_qz[in],
-                    d_m, d_vx, d_vy, d_vz);
-
-                integrate_step<<<numBlocks, blockSize>>>(ctx.n,
-                    d_qx[in], d_qy[in], d_qz[in],
-                    d_vx, d_vy, d_vz,
+                    d_m, d_vx, d_vy, d_vz,
                     d_qx[out], d_qy[out], d_qz[out],
                     ctx.planet, ctx.asteroid, nullptr);
 
@@ -586,6 +594,10 @@ int main(int argc, char** argv) {
                     best_cost = current_cost;
                     best_id = d_idx;
                 }
+                // Signal that we found a solution (since devices are sorted by distance,
+                // the first successful one has the lowest cost)
+                solution_found.store(true);
+                break;
             }
         }
         
@@ -598,14 +610,15 @@ int main(int argc, char** argv) {
         HIP_CHECK(hipFree(d_hit_step)); HIP_CHECK(hipFree(d_destroyed_step));
     };
 
-    std::vector<int> devices0, devices1;
-    for (int i = 0; i < devices.size(); ++i) {
-        if (i & 1) devices1.push_back(devices[i]);
-        else devices0.push_back(devices[i]);
+    // Distribute sorted devices between GPUs (alternating for load balance)
+    std::vector<size_t> indices0, indices1;
+    for (size_t i = 0; i < device_states.size(); ++i) {
+        if (i & 1) indices1.push_back(i);
+        else indices0.push_back(i);
     }
 
-    std::thread p3_0(worker, 0, devices0);
-    std::thread p3_1(worker, 1, devices1);
+    std::thread p3_0(worker, 0, indices0);
+    std::thread p3_1(worker, 1, indices1);
     p3_0.join();
     p3_1.join();
 
