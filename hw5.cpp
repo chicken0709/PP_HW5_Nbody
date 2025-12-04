@@ -39,14 +39,6 @@ __constant__ double d_planet_radius;
 __constant__ double d_missile_speed;
 __constant__ double d_m0[1024];
 
-__global__ void update_mass(int n, double* m, int* type, double t) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n && type[i] == 2) {
-        double tmp = d_m0[i];
-        m[i] = tmp + 0.5 * tmp * fabs(sin(t / 6000.0));
-    }
-}
-
 __global__ void check_min_dist(int planet, int asteroid, double* qx, double* qy, double* qz, double* min_dist) {
     if (threadIdx.x == 0) {
         double dx = qx[planet] - qx[asteroid];
@@ -58,7 +50,8 @@ __global__ void check_min_dist(int planet, int asteroid, double* qx, double* qy,
 }
 
 __global__ void compute_forces_and_integrate(int n, const double* in_qx, const double* in_qy, const double* in_qz,
-                                              const double* m, double* vx, double* vy, double* vz,
+                                              double* m, const int* type, double t,
+                                              double* vx, double* vy, double* vz,
                                               double* out_qx, double* out_qy, double* out_qz,
                                               int planet, int asteroid, double* min_dist) {
     extern __shared__ double shared_mem[];
@@ -68,6 +61,14 @@ __global__ void compute_forces_and_integrate(int n, const double* in_qx, const d
 
     int i = blockIdx.x;
     int j = threadIdx.x;
+
+    // Update mass for devices (fused from update_mass kernel)
+    // Only update if t > 0 (t=0 means no mass update needed, e.g., Problem 1)
+    if (t > 0.0 && type[j] == 2) {
+        double tmp = d_m0[j];
+        m[j] = tmp + 0.5 * tmp * fabs(sin(t / 6000.0));
+    }
+    __syncthreads();
 
     double in_qx_i = in_qx[i];
     double in_qy_i = in_qy[i];
@@ -326,7 +327,8 @@ int main(int argc, char** argv) {
         for (int step = 1; step <= n_steps; step++) {
             compute_forces_and_integrate<<<ctx.n, ctx.n, shared_mem_size>>>(ctx.n,
                 d_qx[in], d_qy[in], d_qz[in],
-                d_m, d_vx, d_vy, d_vz,
+                d_m, d_type, 0.0,  // t=0 means no mass update (devices have mass 0 in P1)
+                d_vx, d_vy, d_vz,
                 d_qx[out], d_qy[out], d_qz[out],
                 ctx.planet, ctx.asteroid, d_min_dist);
             std::swap(in, out);
@@ -400,11 +402,10 @@ int main(int argc, char** argv) {
 
         size_t shared_mem_size = 3 * ctx.n * sizeof(double);
         for (int step = 1; step <= param::n_steps; step++) {
-            update_mass<<<numBlocks, blockSize>>>(ctx.n, d_m, d_type, step * param::dt);
-
             compute_forces_and_integrate<<<ctx.n, ctx.n, shared_mem_size>>>(ctx.n,
                 d_qx[in], d_qy[in], d_qz[in],
-                d_m, d_vx, d_vy, d_vz,
+                d_m, d_type, step * param::dt,
+                d_vx, d_vy, d_vz,
                 d_qx[out], d_qy[out], d_qz[out],
                 ctx.planet, ctx.asteroid, nullptr);
 
@@ -573,11 +574,10 @@ int main(int argc, char** argv) {
 
             size_t shared_mem_size = 3 * ctx.n * sizeof(double);
             for (int step = start_step + 1; step <= param::n_steps; step++) {
-                update_mass<<<numBlocks, blockSize>>>(ctx.n, d_m, d_type, step * param::dt);
-
                 compute_forces_and_integrate<<<ctx.n, ctx.n, shared_mem_size>>>(ctx.n,
                     d_qx[in], d_qy[in], d_qz[in],
-                    d_m, d_vx, d_vy, d_vz,
+                    d_m, d_type, step * param::dt,
+                    d_vx, d_vy, d_vz,
                     d_qx[out], d_qy[out], d_qz[out],
                     ctx.planet, ctx.asteroid, nullptr);
 
